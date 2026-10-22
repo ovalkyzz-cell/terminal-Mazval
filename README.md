@@ -11,14 +11,32 @@ Web terminal berbasis **Tornado + PTY** dengan UI brutalist, file upload streami
 - ⚡ **Brutal Design** — Neobrutalist UI dengan shadow tebal & warna bold
 - 🔄 **Auto-Installer** — Tornado otomatis terinstal jika belum ada
 
+## Dua Entry Point
+
+| File | Runtime | Fungsi |
+|---|---|---|
+| `termux_server.py` | Lokal / Termux (Tornado) | Full storage terminal + gallery (port 8080) |
+| `app.py` | Vercel (FastAPI) | Probe kemampuan runtime Vercel: PTY, bash, writable FS, WebSocket |
+
 ## Cara Menjalankan
 
+### Lokal (storage terminal penuh)
+
 ```bash
-pip install -r requirements.txt
-python app.py
+pip install tornado
+python termux_server.py
 ```
 
 Akses: `http://localhost:8080`
+
+### Vercel (probe runtime)
+
+```bash
+pip install -r requirements.txt
+uvicorn app:app --port 8080
+```
+
+Endpoints: `GET /api/probe` (diagnostik environment), `WS /ws` (uji PTY via WebSocket).
 
 ## Struktur Endpoint
 

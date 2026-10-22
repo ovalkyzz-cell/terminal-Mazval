@@ -1,1 +1,2 @@
-tornado>=6.0
+fastapi>=0.137
+uvicorn[standard]>=0.49

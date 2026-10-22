@@ -6,3 +6,5 @@ venv/
 *.log
 .storage/
 NEXUS_CLOUD_STORAGE/
+.vercel
+.env*
