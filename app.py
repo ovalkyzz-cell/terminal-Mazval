@@ -1,3 +1,4 @@
+import base64
 import json
 import mimetypes
 import os
@@ -8,11 +9,14 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 app = FastAPI(title="Storage Terminal Mazval")
 
@@ -33,7 +37,7 @@ BANNER_MODE = (
     if EPHEMERAL
     else "PIPE SHELL - echo/prompt ditangani readline"
 )
-BANNER_STORE = "EPHEMERAL /tmp (hilang saat cold start)" if EPHEMERAL else "PERMANENT STORAGE"
+BANNER_STORE = "PERMANEN - TERSIMPAN DI CLOUD" if EPHEMERAL else "PERMANENT STORAGE"
 
 _RC_CONTENT = f"""set +H
 HISTSIZE=5000
@@ -76,6 +80,369 @@ def fmt_size(n):
     if n >= 1024:
         return f"{round(n / 1024, 2)} KB"
     return f"{n} B"
+
+
+# ---------------------------------------------------------------------------
+# LAPISAN PENYIMPANAN PERMANEN (repo GitHub privat)
+# ---------------------------------------------------------------------------
+# File di-staging dulu ke /tmp (cepat + pinning instance), lalu didorong
+# segera ke repo GitHub sebagai blob per-part (5MB). List/download/delete
+# selalu membaca dari GitHub sehingga file TETAP ADA walau instance mati.
+GH_API = "https://api.github.com"
+ST_OWNER = os.environ.get("ST_GH_OWNER", "ovalkyzz-cell")
+ST_REPO = os.environ.get("ST_GH_REPO", "terminal-mazval-storage")
+ST_BRANCH = os.environ.get("ST_GH_BRANCH", "main")
+ST_TOKEN = os.environ.get("ST_GH_TOKEN", "")
+ST_PART = 5 * 1048576
+STORE_PREFIX = "_store"
+TREE_TTL = 4.0
+DURABLE = bool(ST_TOKEN)
+
+_GH_LOCK = threading.Lock()
+_BOOT_LOCK = threading.Lock()
+_BOOTED = [False]
+_TREE_CACHE = {"t": 0.0, "entries": None}
+_EMPTY_SHA = [None]
+_PART_DIR = "/tmp/ghc"
+
+
+def _gh(method, path, payload=None, raw=False, timeout=45):
+    if not ST_TOKEN:
+        return 0, b"" if raw else {"message": "token tidak ada"}
+    req = urllib.request.Request(GH_API + path, method=method)
+    req.add_header("Authorization", "Bearer " + ST_TOKEN)
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    req.add_header(
+        "Accept", "application/vnd.github.raw" if raw else "application/vnd.github+json"
+    )
+    if payload is not None:
+        req.data = json.dumps(payload).encode("utf-8")
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+            if raw:
+                return resp.status, body
+            return resp.status, json.loads(body or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read() or b"{}")
+        except Exception:
+            detail = {}
+        msg = detail.get("message") or str(e)
+        return e.code, str(msg).encode() if raw else {"message": msg}
+    except Exception as e:
+        return 0, str(e).encode() if raw else {"message": str(e)}
+
+
+def _ensure_repo():
+    """Repo kosong menolak git-data API -> buat commit awal via Contents API."""
+    if _BOOTED[0]:
+        return True
+    with _BOOT_LOCK:
+        if _BOOTED[0]:
+            return True
+        st, obj = _gh(
+            "PUT",
+            f"/repos/{ST_OWNER}/{ST_REPO}/contents/_boot.md",
+            {
+                "message": "bootstrap: penyimpanan terminal",
+                "content": base64.b64encode(b"# terminal-mazval durable storage\n").decode(),
+            },
+        )
+        if st in (200, 201):
+            _TREE_CACHE["t"] = 0.0
+            _TREE_CACHE["entries"] = None
+            _BOOTED[0] = True
+            return True
+        msg = str(obj.get("message", "")).lower()
+        if "already exists" in msg:
+            _BOOTED[0] = True
+            return True
+        return False
+
+
+def _gh_tree_entries(force=False):
+    now = time.time()
+    if (
+        not force
+        and _TREE_CACHE["entries"] is not None
+        and now - _TREE_CACHE["t"] < TREE_TTL
+    ):
+        return _TREE_CACHE["entries"]
+    st, obj = _gh(
+        "GET", f"/repos/{ST_OWNER}/{ST_REPO}/git/trees/{ST_BRANCH}?recursive=1"
+    )
+    if st == 409 and _ensure_repo():
+        st, obj = _gh(
+            "GET", f"/repos/{ST_OWNER}/{ST_REPO}/git/trees/{ST_BRANCH}?recursive=1"
+        )
+    if st == 409:
+        _TREE_CACHE["t"] = now
+        _TREE_CACHE["entries"] = []
+        return []
+    if st != 200:
+        raise RuntimeError("gagal membaca tree: " + str(obj.get("message", st)))
+    _TREE_CACHE["t"] = now
+    _TREE_CACHE["entries"] = obj.get("tree", [])
+    return _TREE_CACHE["entries"]
+
+
+def _enc_name(name):
+    return urllib.parse.quote(name, safe="")
+
+
+def _empty_sha():
+    if _EMPTY_SHA[0]:
+        return _EMPTY_SHA[0]
+    st, obj = _gh(
+        "POST",
+        f"/repos/{ST_OWNER}/{ST_REPO}/git/blobs",
+        {"content": "", "encoding": "base64"},
+    )
+    if st != 201:
+        raise RuntimeError("gagal blob kosong: " + str(obj.get("message", st)))
+    _EMPTY_SHA[0] = obj["sha"]
+    return obj["sha"]
+
+
+def durable_scan(force=False):
+    """Daftar file permanen dari GitHub: {name: {size, created, parts}}."""
+    if not DURABLE:
+        return {}
+    entries = _gh_tree_entries(force=force)
+    marker_re = re.compile(r"^(?P<size>\d+)__(?P<created>\d+)\.meta$")
+    out = {}
+    for it in entries:
+        parts = (it.get("path") or "").split("/")
+        if len(parts) != 3 or parts[0] != STORE_PREFIX:
+            continue
+        enc, fname = parts[1], parts[2]
+        m = marker_re.match(fname)
+        if m:
+            info = out.get(enc)
+            created = int(m.group("created"))
+            if info is None or created > info["created"]:
+                out[enc] = {
+                    "name": urllib.parse.unquote(enc),
+                    "size": int(m.group("size")),
+                    "created": created,
+                    "parts": info["parts"] if info else [],
+                }
+        elif fname.startswith("p") and fname.endswith(".bin"):
+            info = out.get(enc)
+            if info is None:
+                info = {
+                    "name": urllib.parse.unquote(enc),
+                    "size": -1,
+                    "created": 0,
+                    "parts": [],
+                }
+                out[enc] = info
+            info["parts"].append(
+                {"sha": it.get("sha"), "size": it.get("size") or 0, "path": parts[2]}
+            )
+    result = {}
+    for info in out.values():
+        if info["size"] < 0:
+            continue
+        info["parts"].sort(key=lambda x: x["path"])
+        result[info["name"]] = info
+    return result
+
+
+def durable_get(name):
+    if not DURABLE:
+        return None
+    try:
+        return durable_scan().get(name)
+    except Exception:
+        return None
+
+
+def _commit_tree(message, tree_entries):
+    """Commit penuh (tanpa base_tree) + update ref, dengan retry anti-konflik."""
+    for _ in range(4):
+        st, obj = _gh(
+            "POST", f"/repos/{ST_OWNER}/{ST_REPO}/git/trees", {"tree": tree_entries}
+        )
+        if st != 201:
+            time.sleep(0.5)
+            continue
+        tree_sha = obj["sha"]
+        st, cobj = _gh("GET", f"/repos/{ST_OWNER}/{ST_REPO}/commits/{ST_BRANCH}")
+        parents = [cobj["sha"]] if st == 200 else []
+        st, obj = _gh(
+            "POST",
+            f"/repos/{ST_OWNER}/{ST_REPO}/git/commits",
+            {"message": message, "tree": tree_sha, "parents": parents},
+        )
+        if st != 201:
+            time.sleep(0.5)
+            continue
+        st2, _ = _gh(
+            "PATCH",
+            f"/repos/{ST_OWNER}/{ST_REPO}/git/refs/heads/{ST_BRANCH}",
+            {"sha": obj["sha"]},
+        )
+        if st2 == 200:
+            _TREE_CACHE["t"] = 0.0
+            _TREE_CACHE["entries"] = None
+            return True
+        if st2 in (404, 409, 422):
+            st3, _ = _gh(
+                "POST",
+                f"/repos/{ST_OWNER}/{ST_REPO}/git/refs",
+                {"ref": f"refs/heads/{ST_BRANCH}", "sha": obj["sha"]},
+            )
+            if st3 == 201:
+                _TREE_CACHE["t"] = 0.0
+                _TREE_CACHE["entries"] = None
+                return True
+        time.sleep(0.6)
+    return False
+
+
+def _keep_entries(enc, extra):
+    """Semua leaf blob kecuali bagian file ini, plus entri baru.
+
+    Hanya entri blob (path lengkap) yang dipakai -- GitHub membangun
+    direktori antara otomatis. Entri subtree (type=tree) sengaja TIDAK
+    ikut, kalau tidak subtree lama bisa menempel kembali.
+    """
+    entries = _gh_tree_entries(force=True)
+    drop = f"{STORE_PREFIX}/{enc}/"
+    tree = [
+        {"path": e["path"], "mode": e["mode"], "type": "blob", "sha": e["sha"]}
+        for e in entries
+        if e.get("type") == "blob" and not (e.get("path") or "").startswith(drop)
+    ]
+    tree.extend(extra)
+    return tree
+
+
+def durable_push(name, path, size):
+    """Dorong file yang selesai di-staging ke repo GitHub. Idempoten."""
+    if not DURABLE:
+        return False
+    enc = _enc_name(name)
+    with _GH_LOCK:
+        try:
+            cur = durable_scan(force=True).get(name)
+        except Exception:
+            cur = None
+        if cur and cur["size"] == size and (
+            size == 0 or sum(p["size"] for p in cur["parts"]) == size
+        ):
+            return True
+        add = []
+        if size == 0:
+            add.append(
+                {
+                    "path": f"{STORE_PREFIX}/{enc}/p00000.bin",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": _empty_sha(),
+                }
+            )
+        else:
+            with open(path, "rb") as f:
+                idx = 0
+                while True:
+                    data = f.read(ST_PART)
+                    if not data:
+                        break
+                    st, obj = _gh(
+                        "POST",
+                        f"/repos/{ST_OWNER}/{ST_REPO}/git/blobs",
+                        {
+                            "content": base64.b64encode(data).decode("ascii"),
+                            "encoding": "base64",
+                        },
+                        timeout=120,
+                    )
+                    if st != 201:
+                        return False
+                    add.append(
+                        {
+                            "path": f"{STORE_PREFIX}/{enc}/p{idx:05d}.bin",
+                            "mode": "100644",
+                            "type": "blob",
+                            "sha": obj["sha"],
+                        }
+                    )
+                    idx += 1
+        add.append(
+            {
+                "path": f"{STORE_PREFIX}/{enc}/{size}__{int(time.time())}.meta",
+                "mode": "100644",
+                "type": "blob",
+                "sha": _empty_sha(),
+            }
+        )
+        try:
+            tree_entries = _keep_entries(enc, add)
+        except Exception:
+            return False
+        return _commit_tree(f"store: {name} ({fmt_size(size)})", tree_entries)
+
+
+def durable_delete(name):
+    """Hapus file dari repo GitHub (direktori _store/{enc}/)."""
+    if not DURABLE:
+        return False
+    enc = _enc_name(name)
+    with _GH_LOCK:
+        try:
+            entries = _gh_tree_entries(force=True)
+            drop = f"{STORE_PREFIX}/{enc}/"
+            if not any(
+                e.get("type") == "blob" and (e.get("path") or "").startswith(drop)
+                for e in entries
+            ):
+                return False
+            tree = [
+                {"path": e["path"], "mode": e["mode"], "type": "blob", "sha": e["sha"]}
+                for e in entries
+                if e.get("type") == "blob"
+                and not (e.get("path") or "").startswith(drop)
+            ]
+            return _commit_tree(f"delete: {name}", tree)
+        except Exception:
+            return False
+
+
+def _part_path(sha):
+    if not os.path.isdir(_PART_DIR):
+        os.makedirs(_PART_DIR, exist_ok=True)
+    path = os.path.join(_PART_DIR, sha)
+    if os.path.isfile(path):
+        return path
+    for _ in range(3):
+        st, body = _gh(
+            "GET", f"/repos/{ST_OWNER}/{ST_REPO}/git/blobs/{sha}", raw=True, timeout=90
+        )
+        if st == 200:
+            tmp = path + "." + uuid.uuid4().hex[:6]
+            with open(tmp, "wb") as f:
+                f.write(body)
+            os.replace(tmp, path)
+            try:
+                cached = sorted(
+                    (
+                        os.path.join(_PART_DIR, x)
+                        for x in os.listdir(_PART_DIR)
+                        if x != sha and "." not in x
+                    ),
+                    key=os.path.getmtime,
+                )
+                for old in cached[: max(0, len(cached) - 30)]:
+                    os.remove(old)
+            except Exception:
+                pass
+            return path
+        time.sleep(0.4)
+    return None
 
 
 class ShellSession:
@@ -336,19 +703,50 @@ async def upload(request: Request):
         return JSONResponse(
             {"status": "error", "message": str(e)}, status_code=500
         )
-    return {
+    total = os.path.getsize(path)
+    pushed = None
+    if DURABLE:
+        try:
+            expect = int(request.headers.get("X-File-Size", "-1"))
+        except ValueError:
+            expect = -1
+        if expect >= 0 and total == expect:
+            try:
+                pushed = await run_in_threadpool(durable_push, name, path, total)
+            except Exception:
+                pushed = False
+    resp = {
         "status": "success",
         "name": name,
         "size": size,
-        "total_size": os.path.getsize(path),
+        "total_size": total,
         "instance": INSTANCE_ID,
     }
+    if pushed is not None:
+        resp["durable"] = bool(pushed)
+    return resp
 
 
 @app.get("/api/files")
 def api_files():
     items = []
     used = 0
+    durable = {}
+    if DURABLE:
+        try:
+            durable = durable_scan()
+        except Exception:
+            durable = {}
+    for name, info in sorted(durable.items(), key=lambda kv: kv[1]["created"], reverse=True):
+        items.append(
+            {
+                "name": name,
+                "size_formatted": fmt_size(info["size"]),
+                "size_bytes": info["size"],
+                "durable": True,
+            }
+        )
+        used += info["size"]
     try:
         entries = sorted(
             os.listdir(STORAGE_DIR),
@@ -356,6 +754,8 @@ def api_files():
             reverse=True,
         )
         for fn in entries:
+            if fn in durable:
+                continue
             fp = os.path.join(STORAGE_DIR, fn)
             if not os.path.isfile(fp):
                 continue
@@ -366,6 +766,7 @@ def api_files():
                     "name": fn,
                     "size_formatted": fmt_size(sz),
                     "size_bytes": sz,
+                    "durable": False,
                 }
             )
     except Exception:
@@ -384,6 +785,7 @@ def api_files():
             "free_formatted": fmt_size(du.free),
             "percent": percent,
             "ephemeral": EPHEMERAL,
+            "persistent": DURABLE,
             "label": (
                 "NEXUS CLOUD STORAGE (400 TB POOL)"
                 if EPHEMERAL
@@ -397,20 +799,69 @@ def api_files():
 def delete_file(name: str):
     name = os.path.basename(urllib.parse.unquote(name))
     path = os.path.join(STORAGE_DIR, name)
+    removed = False
     if os.path.isfile(path):
         os.remove(path)
+        removed = True
+    if DURABLE and durable_delete(name):
+        removed = True
+    if removed:
         return {"status": "success"}
     return JSONResponse({"status": "error", "message": "File not found"}, status_code=404)
-
 
 @app.get("/files/{name}")
 def get_file(name: str, request: Request):
     name = os.path.basename(urllib.parse.unquote(name))
     path = os.path.join(STORAGE_DIR, name)
-    if not os.path.isfile(path):
-        return JSONResponse({"error": "File not found"}, status_code=404)
-    size = os.path.getsize(path)
-    ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+    if os.path.isfile(path):
+        size = os.path.getsize(path)
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+        def read_window(start, end):
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = f.read(min(65536, left))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+                    yield chunk
+
+    else:
+        info = durable_get(name)
+        if not info:
+            return JSONResponse({"error": "File not found"}, status_code=404)
+        size = info["size"]
+        parts = info["parts"]
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+        def read_window(start, end):
+            if size == 0 or start > end:
+                return
+            off = 0
+            for part in parts:
+                psize = part["size"]
+                lo, hi = off, off + psize - 1
+                off += psize
+                if hi < start or lo > end:
+                    continue
+                pfile = _part_path(part["sha"])
+                if not pfile:
+                    raise RuntimeError("gagal mengambil bagian file dari penyimpanan")
+                s = max(start, lo) - lo
+                e = min(end, hi) - lo
+                with open(pfile, "rb") as f:
+                    f.seek(s)
+                    left = e - s + 1
+                    while left > 0:
+                        chunk = f.read(min(65536, left))
+                        if not chunk:
+                            break
+                        left -= len(chunk)
+                        yield chunk
+
     range_header = request.headers.get("range")
     if range_header:
         try:
@@ -427,15 +878,7 @@ def get_file(name: str, request: Request):
             length = end - start + 1
 
             def gen_range():
-                with open(path, "rb") as f:
-                    f.seek(start)
-                    left = length
-                    while left > 0:
-                        chunk = f.read(min(65536, left))
-                        if not chunk:
-                            break
-                        left -= len(chunk)
-                        yield chunk
+                yield from read_window(start, end)
 
             return StreamingResponse(
                 gen_range(),
@@ -451,12 +894,7 @@ def get_file(name: str, request: Request):
             pass
 
     def gen_full():
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    break
-                yield chunk
+        yield from read_window(0, size - 1)
 
     return StreamingResponse(
         gen_full(),
@@ -909,9 +1347,9 @@ HTML = f"""<!DOCTYPE html>
             const label = document.getElementById('storageBoxLabel');
             if (label) label.innerText = "📁 " + storage.label;
             const mini = document.getElementById('storageMiniLabel');
-            if (mini) mini.innerText = "STORAGE POOL (400 TB)";
+            if (mini) mini.innerText = "STORAGE POOL (400 TB)" + (storage.persistent ? " • PERMANEN" : "");
             const path = document.getElementById('storagePathText');
-            if (path) path.innerText = "PATH: " + storage.path;
+            if (path) path.innerText = "PATH: " + storage.path + (storage.persistent ? "  •  TERSIMPAN PERMANEN DI CLOUD" : "");
         }}
 
         async function updateStorageInfo() {{
@@ -935,6 +1373,7 @@ HTML = f"""<!DOCTYPE html>
                 xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
                 xhr.setRequestHeader('X-Chunk', String(index));
                 xhr.setRequestHeader('X-Chunk-Total', String(totalChunks));
+                xhr.setRequestHeader('X-File-Size', String(file.size));
                 if (index > 0) xhr.setRequestHeader('X-Append', '1');
                 xhr.upload.onprogress = (e) => {{
                     if (e.lengthComputable && onProgress) onProgress(start + e.loaded);
@@ -980,10 +1419,17 @@ HTML = f"""<!DOCTYPE html>
                         }}
                         if (!advance) throw new Error('storage instance tidak sinkron');
                     }}
-                    const check = await fetch('/api/files').then(r => r.json()).catch(() => null);
-                    const entry = check && check.files ? check.files.find(f => f.name === file.name) : null;
-                    if (entry && entry.size_bytes === file.size) return true;
-                    throw new Error('verifikasi ukuran gagal');
+                    let verified = false;
+                    for (let v = 0; v < 3 && !verified; v++) {{
+                        if (v > 0) await sleep(1500);
+                        const check = await fetch('/api/files').then(r => r.json()).catch(() => null);
+                        const entry = check && check.files ? check.files.find(f => f.name === file.name) : null;
+                        const persistent = !!(check && check.storage && check.storage.persistent);
+                        verified = !!(entry && entry.size_bytes === file.size
+                            && (!persistent || entry.durable === true));
+                    }}
+                    if (verified) return true;
+                    throw new Error('verifikasi penyimpanan permanen gagal');
                 }} catch (e) {{
                     lastError = e;
                     if (fileAttempt < MAX_FILE_ATTEMPTS) {{
@@ -1015,7 +1461,7 @@ HTML = f"""<!DOCTYPE html>
 
             if (failed.length === 0) {{
                 const mb = (files.reduce((a, f) => a + f.size, 0) / 1048576).toFixed(2);
-                log.innerText = `[UPLOADING] 100% (${{mb}} MB total)\n[SUCCESS] Semua file tersimpan! Ketik 'ls' di terminal atau buka tab Gallery.`;
+                log.innerText = `[UPLOADING] 100% (${{mb}} MB total)\n[SUCCESS] Semua file TERSIMPAN PERMANEN di cloud! Ketik 'ls' di terminal atau buka tab Gallery.`;
                 fileInput.value = "";
                 document.getElementById('fileNameDisplay').innerText = "Pilih file ke brankas...";
                 setTimeout(() => {{ switchTab('gallery'); loadGallery(); }}, 800);

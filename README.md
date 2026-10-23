@@ -5,11 +5,11 @@ Web terminal berbasis **bash pipe (PTY-free)** dengan UI brutalist, file upload 
 ## Fitur
 
 - 🖥️ **Web Terminal** — shell bash interaktif via xterm.js: echo, prompt, history, tab-completion ditangani readline server-side (tanpa TTY)
-- 📁 **Storage Engine** — upload streaming **chunked** (bagian 3 MB per request) — **tanpa batas ukuran file**, list, hapus, preview
+- 📁 **Storage Engine** — upload streaming **chunked** (bagian 4 MB per request) — **tanpa batas ukuran file**, list, hapus, preview — **tersimpan permanen di cloud** (repo privat GitHub), tidak hilang walau instance mati
 - 🖼️ **Gallery Preview** — preview gambar & video dengan Range request / streaming
 - 📱 **Mobile Friendly** — tombol shortcut (^C, TAB, PY, LS, CLR, ▲▼)
 - ⚡ **Brutal Design** — neobrutalist UI dengan shadow tebal & warna bold
-- ☁️ **Vercel Ready** — respons streaming SSE, shell per-instance, storage `/tmp`
+- ☁️ **Vercel Ready** — respons streaming SSE, shell per-instance, storage `/tmp` sebagai cache + durable cloud sebagai sumber kebenaran
 
 ## Dua Entry Point
 
@@ -49,7 +49,7 @@ Akses: `http://localhost:8080`
 | `/api/shell/<id>/input` | POST | Kirum input keystroke (batch) |
 | `/api/shell/<id>/interrupt` | POST | ^C (SIGINT ke process group) |
 | `/api/shell/<id>` | DELETE | Tutup sesi shell |
-| `/upload` | POST | Upload streaming file (header `X-Filename`, opsional `X-Chunk`/`X-Chunk-Total`/`X-Append` untuk file besar) |
+| `/upload` | POST | Upload streaming file (header `X-Filename`, `X-File-Size`, opsional `X-Chunk`/`X-Chunk-Total`/`X-Append` untuk file besar) — otomatis didorong ke storage permanen setelah staging lengkap |
 | `/api/files` | GET | List file + info storage |
 | `/api/files/<nama>` | DELETE | Hapus file |
 | `/files/<nama>` | GET | Streaming/preview file (dukung Range) |
@@ -68,8 +68,8 @@ Vercel serverless **tidak menyediakan PTY** (`/dev/ptmx` tidak ada), jadi termin
 ### Catatan Teknis Vercel
 
 - PTY tidak tersedia di runtime serverless → terminal dibangun dari bash pipe + readline (echo, prompt, history, completion tetap jalan). TUI berat (`vim`, `htop`) tidak didesain untuk mode ini.
-- Storage berada di `/tmp` instance — data bertahan selama instance hidup; setelah cold start/deploy baru storage kosong lagi.
-- Upload file besar dipecah client menjadi bagian 3 MB (melewati batas request body per-request), lalu diverifikasi ukurannya setelah selesai.
+- **Storage permanen dua lapis**: file di-staging dulu ke `/tmp` instance (cepat, pinning instance), lalu didorong ke **repo GitHub privat** (`_store/...` per-part 5MB + marker meta) begitu lengkap. List/download/delete selalu membaca dari GitHub → file **tetap ada** setelah cold start/deploy baru. `/tmp` hanya cache baca (download yang belum ada di cache diambil dari GitHub, dengan dukungan Range).
+- Upload file besar dipecah client menjadi bagian 4 MB (melewati batas request body per-request), diverifikasi ukurannya setelah selesai, dengan retry per-bagian + pinning instance + auto-restart file bila gagal.
 - Stream sesi berakhir otomatis pada batas durasi function, lalu **otomatis menyambung ulang ke sesi yang sama** — shell, cwd, dan proses tetap hidup.
 - Di Termux (Tornado + PTY) semua alur di atas berjalan penuh dengan storage permanen.
 
