@@ -321,7 +321,11 @@ async def upload(request: Request):
     name = os.path.basename(urllib.parse.unquote(raw)).strip() or "upload.bin"
     path = os.path.join(STORAGE_DIR, name)
     append = request.headers.get("X-Append") == "1"
-    mode = "ab" if append and os.path.exists(path) else "wb"
+    if append and not os.path.exists(path):
+        async for _ in request.stream():
+            pass
+        return {"status": "retry", "instance": INSTANCE_ID, "reason": "chunk_awal_di_instance_lain"}
+    mode = "ab" if append else "wb"
     size = 0
     try:
         with open(path, mode) as f:
@@ -918,19 +922,14 @@ HTML = f"""<!DOCTYPE html>
             }} catch (e) {{ console.log("Storage sync error"); }}
         }}
 
-        async function uploadFile() {{
-            const fileInput = document.getElementById('fileInput');
-            const log = document.getElementById('progressLog');
-            if (fileInput.files.length === 0) return alert("Pilih file terlebih dahulu!");
+        const CHUNK_SIZE = 4 * 1048576;
+        const MAX_FILE_ATTEMPTS = 3;
+        const MAX_CHUNK_ATTEMPTS = 8;
 
-            const file = fileInput.files[0];
-            const CHUNK = 3 * 1048576;
-            const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK));
-            log.innerText = `[PREP] Membuka kanal upload ${{totalChunks}} bagian...`;
-
-            const sendChunk = (index) => new Promise((resolve, reject) => {{
-                const start = index * CHUNK;
-                const blob = file.slice(start, Math.min(file.size, start + CHUNK));
+        function sendChunk(file, index, totalChunks, pinned, onProgress) {{
+            return new Promise((resolve, reject) => {{
+                const start = index * CHUNK_SIZE;
+                const blob = file.slice(start, Math.min(file.size, start + CHUNK_SIZE));
                 const xhr = new XMLHttpRequest();
                 xhr.open('POST', '/upload', true);
                 xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
@@ -938,41 +937,90 @@ HTML = f"""<!DOCTYPE html>
                 xhr.setRequestHeader('X-Chunk-Total', String(totalChunks));
                 if (index > 0) xhr.setRequestHeader('X-Append', '1');
                 xhr.upload.onprogress = (e) => {{
-                    if (e.lengthComputable) {{
-                        const sent = Math.min(file.size, start + e.loaded);
-                        const percent = Math.round((sent / file.size) * 100);
-                        const mbL = (sent / 1048576).toFixed(2);
-                        const mbT = (file.size / 1048576).toFixed(2);
-                        log.innerText = `[UPLOADING] ${{percent}}% (${{mbL}} MB / ${{mbT}} MB) - bagian ${{index + 1}}/${{totalChunks}}\n[STREAM] 0% RAM HP`;
-                    }}
+                    if (e.lengthComputable && onProgress) onProgress(start + e.loaded);
                 }};
                 xhr.onload = () => {{
                     if (xhr.status === 200) {{
-                        try {{ resolve(JSON.parse(xhr.responseText)); }}
-                        catch (e) {{ resolve({{}}); }}
+                        try {{ resolve(JSON.parse(xhr.responseText) || {{}}); }}
+                        catch (err) {{ resolve({{}}); }}
                     }} else reject(new Error('HTTP ' + xhr.status));
                 }};
-                xhr.onerror = () => reject(new Error('koneksi gagal'));
+                xhr.onerror = () => reject(new Error('koneksi terputus'));
                 xhr.send(blob);
             }});
+        }}
 
-            try {{
-                for (let i = 0; i < totalChunks; i++) {{
-                    await sendChunk(i);
+        async function uploadOneFile(file, fileLabel, log) {{
+            const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+            let lastError = null;
+            for (let fileAttempt = 1; fileAttempt <= MAX_FILE_ATTEMPTS; fileAttempt++) {{
+                try {{
+                    let pinned = null;
+                    for (let i = 0; i < totalChunks; i++) {{
+                        let chunkAttempt = 0;
+                        let advance = false;
+                        while (!advance && chunkAttempt < MAX_CHUNK_ATTEMPTS) {{
+                            chunkAttempt++;
+                            const res = await sendChunk(file, i, totalChunks, pinned, (sent) => {{
+                                const s = Math.min(file.size, sent);
+                                const pct = Math.round((s / file.size) * 100);
+                                log.innerText = `[UPLOADING] ${{fileLabel}} ${{pct}}% (${{(s / 1048576).toFixed(2)}} MB / ${{(file.size / 1048576).toFixed(2)}} MB) - bagian ${{i + 1}}/${{totalChunks}}\n[STREAM] 0% RAM HP`;
+                            }});
+                            if (!res || res.status === 'error') {{
+                                throw new Error((res && res.message) || 'gagal mengirim bagian');
+                            }}
+                            if (pinned === null) {{
+                                pinned = res.instance || null;
+                                advance = true;
+                            }} else if (res.status === 'retry' || (res.instance && pinned && res.instance !== pinned)) {{
+                                await sleep(300);
+                            }} else {{
+                                advance = true;
+                            }}
+                        }}
+                        if (!advance) throw new Error('storage instance tidak sinkron');
+                    }}
+                    const check = await fetch('/api/files').then(r => r.json()).catch(() => null);
+                    const entry = check && check.files ? check.files.find(f => f.name === file.name) : null;
+                    if (entry && entry.size_bytes === file.size) return true;
+                    throw new Error('verifikasi ukuran gagal');
+                }} catch (e) {{
+                    lastError = e;
+                    if (fileAttempt < MAX_FILE_ATTEMPTS) {{
+                        log.innerText = `[RETRY] ${{fileLabel}} percobaan ${{fileAttempt + 1}}/${{MAX_FILE_ATTEMPTS}}...`;
+                        await sleep(700);
+                    }}
                 }}
-                const check = await fetch('/api/files').then(r => r.json()).catch(() => null);
-                const entry = check ? check.files.find(f => f.name === file.name) : null;
-                if (entry && entry.size_bytes === file.size) {{
-                    const mbT = (file.size / 1048576).toFixed(2);
-                    log.innerText = `[UPLOADING] 100% (${{mbT}} MB / ${{mbT}} MB)\n[SUCCESS] File tersimpan! Ketik 'ls' atau 'python3 ${{file.name}}' di terminal.`;
-                    fileInput.value = "";
-                    document.getElementById('fileNameDisplay').innerText = "Pilih file ke brankas...";
-                    setTimeout(() => {{ switchTab('gallery'); loadGallery(); }}, 1000);
-                }} else {{
-                    log.innerText += `\n\n[ERROR] File belum lengkap di storage, ulangi upload.`;
+            }}
+            throw lastError || new Error('gagal');
+        }}
+
+        async function uploadFile() {{
+            const fileInput = document.getElementById('fileInput');
+            const log = document.getElementById('progressLog');
+            if (fileInput.files.length === 0) return alert("Pilih file terlebih dahulu!");
+
+            const files = Array.from(fileInput.files);
+            log.innerText = `[PREP] Menyiapkan ${{files.length}} file...`;
+            const failed = [];
+
+            for (let fi = 0; fi < files.length; fi++) {{
+                const file = files[fi];
+                try {{
+                    await uploadOneFile(file, `[${{fi + 1}}/${{files.length}}] ${{file.name}}`, log);
+                }} catch (e) {{
+                    failed.push(file.name + ' (' + ((e && e.message) || e) + ')');
                 }}
-            }} catch (e) {{
-                log.innerText += `\n\n[ERROR] Gagal upload: ${{e.message || e}}`;
+            }}
+
+            if (failed.length === 0) {{
+                const mb = (files.reduce((a, f) => a + f.size, 0) / 1048576).toFixed(2);
+                log.innerText = `[UPLOADING] 100% (${{mb}} MB total)\n[SUCCESS] Semua file tersimpan! Ketik 'ls' di terminal atau buka tab Gallery.`;
+                fileInput.value = "";
+                document.getElementById('fileNameDisplay').innerText = "Pilih file ke brankas...";
+                setTimeout(() => {{ switchTab('gallery'); loadGallery(); }}, 800);
+            }} else {{
+                log.innerText += `\n\n[ERROR] Gagal: ${{failed.join(', ')}}`;
             }}
         }}
 
