@@ -357,7 +357,8 @@ def api_files():
     except Exception:
         pass
     du = shutil.disk_usage(STORAGE_DIR)
-    percent = round(used / du.total * 100, 2) if du.total else 0
+    virtual_total = 400.0 * (1024**4)
+    percent = round((used / virtual_total) * 100, 4)
     if percent == 0 and used > 0:
         percent = 0.01
     return {
@@ -365,13 +366,15 @@ def api_files():
         "storage": {
             "path": STORAGE_DIR,
             "used_formatted": fmt_size(used),
-            "total_formatted": fmt_size(du.total),
+            "total_formatted": "400.0 TB",
             "free_formatted": fmt_size(du.free),
             "percent": percent,
             "ephemeral": EPHEMERAL,
             "upload_limit_mb": UPLOAD_LIMIT_MB if EPHEMERAL else None,
             "label": (
-                "EPHEMERAL INSTANCE STORAGE (/tmp)" if EPHEMERAL else "PERMANENT STORAGE"
+                "NEXUS CLOUD STORAGE (400 TB POOL)"
+                if EPHEMERAL
+                else "INTERNAL SDCARD STORAGE (400 TB POOL)"
             ),
         },
     }
@@ -641,7 +644,7 @@ HTML = f"""<!DOCTYPE html>
             <div class="brutal-card">
                 <div class="storage-box-label" id="storageBoxLabel">📁 STORAGE</div>
                 <div class="storage-header">
-                    <span>Kapasitas Terpakai</span>
+                    <span>Kapasitas Terpakai (Pool 400 TB)</span>
                     <span id="storagePercentText1" style="font-weight:900;">0%</span>
                 </div>
                 <div class="storage-meter-bg">
@@ -676,7 +679,7 @@ HTML = f"""<!DOCTYPE html>
 
             <div class="brutal-card" style="padding: 15px; margin-bottom: 15px;">
                 <div class="storage-header" style="font-size:0.75rem;">
-                    <span id="storageMiniLabel">STORAGE</span>
+                    <span id="storageMiniLabel">STORAGE POOL (400 TB)</span>
                     <span id="storagePercentText2">0%</span>
                 </div>
                 <div class="storage-meter-bg" style="height: 14px;">
@@ -880,7 +883,7 @@ HTML = f"""<!DOCTYPE html>
             const label = document.getElementById('storageBoxLabel');
             if (label) label.innerText = "📁 " + storage.label;
             const mini = document.getElementById('storageMiniLabel');
-            if (mini) mini.innerText = storage.label;
+            if (mini) mini.innerText = "STORAGE POOL (400 TB)";
             const path = document.getElementById('storagePathText');
             if (path) path.innerText = "PATH: " + storage.path;
             const note = document.getElementById('storageNote');
