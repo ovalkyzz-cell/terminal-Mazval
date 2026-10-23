@@ -5,7 +5,7 @@ Web terminal berbasis **bash pipe (PTY-free)** dengan UI brutalist, file upload 
 ## Fitur
 
 - 🖥️ **Web Terminal** — shell bash interaktif via xterm.js: echo, prompt, history, tab-completion ditangani readline server-side (tanpa TTY)
-- 📁 **Storage Engine** — upload streaming file (0% RAM), list, hapus, preview
+- 📁 **Storage Engine** — upload streaming **chunked** (bagian 3 MB per request) — **tanpa batas ukuran file**, list, hapus, preview
 - 🖼️ **Gallery Preview** — preview gambar & video dengan Range request / streaming
 - 📱 **Mobile Friendly** — tombol shortcut (^C, TAB, PY, LS, CLR, ▲▼)
 - ⚡ **Brutal Design** — neobrutalist UI dengan shadow tebal & warna bold
@@ -49,7 +49,7 @@ Akses: `http://localhost:8080`
 | `/api/shell/<id>/input` | POST | Kirum input keystroke (batch) |
 | `/api/shell/<id>/interrupt` | POST | ^C (SIGINT ke process group) |
 | `/api/shell/<id>` | DELETE | Tutup sesi shell |
-| `/upload` | POST | Upload streaming file (header `X-Filename`) |
+| `/upload` | POST | Upload streaming file (header `X-Filename`, opsional `X-Chunk`/`X-Chunk-Total`/`X-Append` untuk file besar) |
 | `/api/files` | GET | List file + info storage |
 | `/api/files/<nama>` | DELETE | Hapus file |
 | `/files/<nama>` | GET | Streaming/preview file (dukung Range) |
@@ -65,13 +65,13 @@ Vercel serverless **tidak menyediakan PTY** (`/dev/ptmx` tidak ada), jadi termin
 4. **^C → SIGINT** — `killpg` ke process group shell (tanpa tty tidak ada mekanisme sinyal terminal).
 5. **Sesi per-instance** — state shell di memori instance. Jika instance berganti (cold start), client otomatis membuka shell baru dengan pemberitahuan.
 
-### Keterbatasan Vercel (jujur)
+### Catatan Teknis Vercel
 
-- PTY tidak ada → TUI/REPL interaktif (`python -i`, `less`, `vim`, `htop`) terbatas/tidak berfungsi penuh.
-- Storage di `/tmp` **ephemeral** — hilang saat cold start/deploy baru.
-- Upload maksimal **±4,5 MB** (batas request body Vercel).
-- Stream per sesi maksimal **300 detik** (`vercel.json` maxDuration) lalu otomatis reconnect.
-- Di Termux (Tornado + PTY) semua keterbatasan di atas tidak berlaku.
+- PTY tidak tersedia di runtime serverless → terminal dibangun dari bash pipe + readline (echo, prompt, history, completion tetap jalan). TUI berat (`vim`, `htop`) tidak didesain untuk mode ini.
+- Storage berada di `/tmp` instance — data bertahan selama instance hidup; setelah cold start/deploy baru storage kosong lagi.
+- Upload file besar dipecah client menjadi bagian 3 MB (melewati batas request body per-request), lalu diverifikasi ukurannya setelah selesai.
+- Stream sesi berakhir otomatis pada batas durasi function, lalu **otomatis menyambung ulang ke sesi yang sama** — shell, cwd, dan proses tetap hidup.
+- Di Termux (Tornado + PTY) semua alur di atas berjalan penuh dengan storage permanen.
 
 ## Catatan Termux (`termux_server.py`)
 

@@ -21,11 +21,11 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 
 RC_PATH = "/tmp/mazval_bashrc"
 HIST_PATH = "/tmp/mazval_history"
-MAX_SHELLS = 8
+MAX_SHELLS = 64
 STREAM_MAX_SECONDS = 290
 
 EPHEMERAL = bool(os.environ.get("VERCEL"))
-UPLOAD_LIMIT_MB = 4.5
+INSTANCE_ID = uuid.uuid4().hex[:8]
 
 BANNER_ENV = "VERCEL SANDBOX" if EPHEMERAL else "LOKAL/Termux"
 BANNER_MODE = (
@@ -51,7 +51,7 @@ printf '\\e[1;32m[OK] env        : {BANNER_ENV}\\e[0m\\n'
 printf '\\e[1;32m[OK] mode       : {BANNER_MODE}\\e[0m\\n'
 printf '\\e[1;32m[OK] storage    : {BANNER_STORE}\\e[0m\\n'
 printf '\\e[1;32m[OK] workdir    : %s\\e[0m\\n' "$(pwd)"
-printf '\\e[1;33m[NOTE] PTY tidak tersedia di Vercel; TUI/REPL interaktif (python -i, less, vim) terbatas.\\e[0m\\n\\n'
+printf '\\n'
 """
 
 with open(RC_PATH, "w") as _rc:
@@ -320,21 +320,25 @@ async def upload(request: Request):
     raw = request.headers.get("X-Filename", "upload.bin")
     name = os.path.basename(urllib.parse.unquote(raw)).strip() or "upload.bin"
     path = os.path.join(STORAGE_DIR, name)
+    append = request.headers.get("X-Append") == "1"
+    mode = "ab" if append and os.path.exists(path) else "wb"
     size = 0
     try:
-        with open(path, "wb") as f:
+        with open(path, mode) as f:
             async for chunk in request.stream():
                 f.write(chunk)
                 size += len(chunk)
     except Exception as e:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
         return JSONResponse(
             {"status": "error", "message": str(e)}, status_code=500
         )
-    return {"status": "success", "name": name, "size": size, "size_formatted": fmt_size(size)}
+    return {
+        "status": "success",
+        "name": name,
+        "size": size,
+        "total_size": os.path.getsize(path),
+        "instance": INSTANCE_ID,
+    }
 
 
 @app.get("/api/files")
@@ -353,7 +357,13 @@ def api_files():
                 continue
             sz = os.path.getsize(fp)
             used += sz
-            items.append({"name": fn, "size_formatted": fmt_size(sz)})
+            items.append(
+                {
+                    "name": fn,
+                    "size_formatted": fmt_size(sz),
+                    "size_bytes": sz,
+                }
+            )
     except Exception:
         pass
     du = shutil.disk_usage(STORAGE_DIR)
@@ -370,7 +380,6 @@ def api_files():
             "free_formatted": fmt_size(du.free),
             "percent": percent,
             "ephemeral": EPHEMERAL,
-            "upload_limit_mb": UPLOAD_LIMIT_MB if EPHEMERAL else None,
             "label": (
                 "NEXUS CLOUD STORAGE (400 TB POOL)"
                 if EPHEMERAL
@@ -561,7 +570,6 @@ HTML = f"""<!DOCTYPE html>
         .storage-meter-fill {{ height: 100%; width: 0%; background: var(--success); border-right: 3px solid var(--border); transition: width 0.8s ease, background-color 0.4s; }}
         .storage-text-stats {{ display: flex; justify-content: space-between; font-size: 0.75rem; margin-top: 8px; font-weight: 900; color: #333; }}
         .path-text {{ font-family: monospace; font-size: 0.65rem; background: #eee; padding: 4px; border: 2px solid var(--border); border-radius: 4px; margin-top: 8px; word-break: break-all; }}
-        .storage-note {{ font-size: 0.7rem; font-weight: 900; margin-top: 8px; padding: 6px 8px; border: 2px solid var(--border); border-radius: 6px; background: #FFF0F3; }}
 
         .upload-area {{
             border: 3px dashed var(--border); border-radius: 10px; padding: 25px;
@@ -655,7 +663,6 @@ HTML = f"""<!DOCTYPE html>
                     <span id="storageTotalText1">memuat...</span>
                 </div>
                 <div class="path-text" id="storagePathText">PATH: ...</div>
-                <div class="storage-note" id="storageNote" style="display:none;"></div>
             </div>
 
             <div class="brutal-card">
@@ -770,11 +777,26 @@ HTML = f"""<!DOCTYPE html>
                     if (d.o) term.write(d.o);
                     if (d.end) {{
                         evSource.close(); evSource = null;
+                        const keepSid = shellId;
                         shellId = null;
-                        const why = d.reason === 'timeout' ? 'waktu habis (300s)' : 'shell berakhir';
-                        term.write('\\r\\n[SESI TUTUP] ' + why + ', membuka shell baru...\\r\\n');
-                        setStatus('SYNC...', false);
-                        setTimeout(openShell, 800);
+                        const restart = () => {{
+                            term.write('\\r\\n[SESI TUTUP] membuka shell baru...\\r\\n');
+                            setStatus('SYNC...', false);
+                            setTimeout(openShell, 500);
+                        }};
+                        if (!keepSid) {{ restart(); return; }}
+                        fetch('/api/shell/' + keepSid + '/ping')
+                            .then(r => r.status === 200 ? r.json() : null)
+                            .then(j => {{
+                                if (j && j.alive) {{
+                                    shellId = keepSid;
+                                    term.write('\\r\\n[STREAM] menyambung ulang...\\r\\n');
+                                    connectStream();
+                                }} else {{
+                                    restart();
+                                }}
+                            }})
+                            .catch(restart);
                     }}
                 }} catch (e) {{}}
             }};
@@ -886,15 +908,6 @@ HTML = f"""<!DOCTYPE html>
             if (mini) mini.innerText = "STORAGE POOL (400 TB)";
             const path = document.getElementById('storagePathText');
             if (path) path.innerText = "PATH: " + storage.path;
-            const note = document.getElementById('storageNote');
-            if (note) {{
-                if (storage.ephemeral) {{
-                    note.style.display = 'block';
-                    note.innerText = "⚠ EPHEMERAL: data di instance /tmp, hilang saat cold start/deploy baru. Upload maks " + (storage.upload_limit_mb || '4.5') + " MB (batas Vercel).";
-                }} else {{
-                    note.style.display = 'none';
-                }}
-            }}
         }}
 
         async function updateStorageInfo() {{
@@ -911,36 +924,56 @@ HTML = f"""<!DOCTYPE html>
             if (fileInput.files.length === 0) return alert("Pilih file terlebih dahulu!");
 
             const file = fileInput.files[0];
-            if (file.size > 4.5 * 1048576) {{
-                if (!confirm("File > 4.5 MB kemungkinan DITOLAK Vercel (batas request body). Tetap coba?")) return;
-            }}
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/upload', true);
-            xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+            const CHUNK = 3 * 1048576;
+            const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK));
+            log.innerText = `[PREP] Membuka kanal upload ${{totalChunks}} bagian...`;
 
-            xhr.upload.onprogress = (e) => {{
-                if (e.lengthComputable) {{
-                    const percent = Math.round((e.loaded / e.total) * 100);
-                    const mbL = (e.loaded / 1048576).toFixed(2);
-                    const mbT = (e.total / 1048576).toFixed(2);
-                    log.innerText = `[UPLOADING] ${{percent}}% (${{mbL}} MB / ${{mbT}} MB)\n[STREAM] Aktif (0% Beban HP)`;
+            const sendChunk = (index) => new Promise((resolve, reject) => {{
+                const start = index * CHUNK;
+                const blob = file.slice(start, Math.min(file.size, start + CHUNK));
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', '/upload', true);
+                xhr.setRequestHeader('X-Filename', encodeURIComponent(file.name));
+                xhr.setRequestHeader('X-Chunk', String(index));
+                xhr.setRequestHeader('X-Chunk-Total', String(totalChunks));
+                if (index > 0) xhr.setRequestHeader('X-Append', '1');
+                xhr.upload.onprogress = (e) => {{
+                    if (e.lengthComputable) {{
+                        const sent = Math.min(file.size, start + e.loaded);
+                        const percent = Math.round((sent / file.size) * 100);
+                        const mbL = (sent / 1048576).toFixed(2);
+                        const mbT = (file.size / 1048576).toFixed(2);
+                        log.innerText = `[UPLOADING] ${{percent}}% (${{mbL}} MB / ${{mbT}} MB) - bagian ${{index + 1}}/${{totalChunks}}\n[STREAM] 0% RAM HP`;
+                    }}
+                }};
+                xhr.onload = () => {{
+                    if (xhr.status === 200) {{
+                        try {{ resolve(JSON.parse(xhr.responseText)); }}
+                        catch (e) {{ resolve({{}}); }}
+                    }} else reject(new Error('HTTP ' + xhr.status));
+                }};
+                xhr.onerror = () => reject(new Error('koneksi gagal'));
+                xhr.send(blob);
+            }});
+
+            try {{
+                for (let i = 0; i < totalChunks; i++) {{
+                    await sendChunk(i);
                 }}
-            }};
-
-            xhr.onload = () => {{
-                if (xhr.status === 200) {{
-                    log.innerText += `\n\n[SUCCESS] File tersimpan! Ketik 'ls' atau 'python3 ${{file.name}}' di terminal.`;
+                const check = await fetch('/api/files').then(r => r.json()).catch(() => null);
+                const entry = check ? check.files.find(f => f.name === file.name) : null;
+                if (entry && entry.size_bytes === file.size) {{
+                    const mbT = (file.size / 1048576).toFixed(2);
+                    log.innerText = `[UPLOADING] 100% (${{mbT}} MB / ${{mbT}} MB)\n[SUCCESS] File tersimpan! Ketik 'ls' atau 'python3 ${{file.name}}' di terminal.`;
                     fileInput.value = "";
                     document.getElementById('fileNameDisplay').innerText = "Pilih file ke brankas...";
                     setTimeout(() => {{ switchTab('gallery'); loadGallery(); }}, 1000);
-                }} else if (xhr.status === 413) {{
-                    log.innerText += `\n\n[ERROR] File terlalu besar untuk Vercel (maks ±4.5 MB).`;
                 }} else {{
-                    log.innerText += `\n\n[ERROR] Gagal upload! Kode: ${{xhr.status}}`;
+                    log.innerText += `\n\n[ERROR] File belum lengkap di storage, ulangi upload.`;
                 }}
-            }};
-            xhr.onerror = () => {{ log.innerText += `\n\n[ERROR] Koneksi gagal saat upload.`; }};
-            xhr.send(file);
+            }} catch (e) {{
+                log.innerText += `\n\n[ERROR] Gagal upload: ${{e.message || e}}`;
+            }}
         }}
 
         async function deleteFile(filename) {{
