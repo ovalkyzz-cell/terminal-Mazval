@@ -790,30 +790,41 @@ HTML = f"""<!DOCTYPE html>
             }};
         }}
 
+        function sleep(ms) {{ return new Promise(res => setTimeout(res, ms)); }}
+
+        async function postInput(payload, attempt) {{
+            if (!shellId) return;
+            try {{
+                const r = await fetch('/api/shell/' + shellId + '/input', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ data: payload }})
+                }});
+                if (r.status === 404) {{
+                    if (attempt === 0) {{
+                        await sleep(600);
+                        return await postInput(payload, 1);
+                    }}
+                    if (evSource) {{ evSource.close(); evSource = null; }}
+                    shellId = null;
+                    term.write('\\r\\n[SESSION HILANG] membuka shell baru...\\r\\n');
+                    setStatus('SYNC...', false);
+                    openShell();
+                    return;
+                }}
+                setStatus('ONLINE', true);
+            }} catch (e) {{
+                setStatus('RETRY...', false);
+            }}
+        }}
+
         async function flushInput() {{
             flushTimer = null;
             if (!shellId) return;
             if (inputBuf) {{
                 const payload = inputBuf;
                 inputBuf = '';
-                try {{
-                    const r = await fetch('/api/shell/' + shellId + '/input', {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'application/json' }},
-                        body: JSON.stringify({{ data: payload }})
-                    }});
-                    if (r.status === 404) {{
-                        if (evSource) {{ evSource.close(); evSource = null; }}
-                        shellId = null;
-                        term.write('\\r\\n[SESSION HILANG] membuka shell baru...\\r\\n');
-                        setStatus('SYNC...', false);
-                        openShell();
-                        return;
-                    }}
-                    setStatus('ONLINE', true);
-                }} catch (e) {{
-                    setStatus('RETRY...', false);
-                }}
+                await postInput(payload, 0);
             }}
         }}
 
