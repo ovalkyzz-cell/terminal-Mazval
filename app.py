@@ -1,4 +1,6 @@
 import base64
+import codecs
+import errno
 import json
 import mimetypes
 import os
@@ -14,6 +16,18 @@ import urllib.parse
 import urllib.request
 import uuid
 
+try:
+    import fcntl
+    import pty
+    import select
+    import struct
+    import termios
+
+    _PTY_IMPORT_ERROR = ""
+except Exception as _pty_exc:  # pragma: no cover - platform non-unix
+    fcntl = pty = select = struct = termios = None
+    _PTY_IMPORT_ERROR = f"{type(_pty_exc).__name__}: {_pty_exc}"
+
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
@@ -27,23 +41,128 @@ RC_PATH = "/tmp/mazval_bashrc"
 HIST_PATH = "/tmp/mazval_history"
 MAX_SHELLS = 64
 STREAM_MAX_SECONDS = 290
+MAX_INPUT = 65536
+MAX_BUFFER = 4 * 1048576
+DEFAULT_COLS = 120
+DEFAULT_ROWS = 40
 
 EPHEMERAL = bool(os.environ.get("VERCEL"))
 INSTANCE_ID = uuid.uuid4().hex[:8]
 
-BANNER_ENV = "VERCEL SANDBOX" if EPHEMERAL else "LOKAL/Termux"
-BANNER_MODE = (
-    "PIPE SHELL (tanpa TTY) - echo/prompt ditangani readline"
-    if EPHEMERAL
-    else "PIPE SHELL - echo/prompt ditangani readline"
+
+def _pty_works():
+    """Cek nyata apakah runtime menyediakan PTY (/dev/ptmx + devpts)."""
+    if _PTY_IMPORT_ERROR:
+        return False
+    master = slave = None
+    try:
+        master, slave = pty.openpty()
+        return True
+    except Exception:
+        return False
+    finally:
+        for fd in (master, slave):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+# Mode shell bisa dipaksa lewat env (untuk uji jalur cadangan):
+#   MAZVAL_SHELL_MODE=pipe  -> paksa pipe walau PTY tersedia
+#   MAZVAL_SHELL_MODE=pty   -> paksa PTY (gagal jika runtime tanpa PTY)
+FORCE_MODE = os.environ.get("MAZVAL_SHELL_MODE", "").strip().lower()
+PTY_AVAILABLE = _pty_works() and FORCE_MODE != "pipe"
+SHELL_MODE = "pty" if PTY_AVAILABLE else "pipe"
+
+
+def _terminfo_ok(name):
+    if not name:
+        return False
+    if shutil.which("infocmp"):
+        try:
+            p = subprocess.run(
+                ["infocmp", "-1", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            if p.returncode == 0:
+                return True
+        except Exception:
+            pass
+    roots = [
+        os.environ.get("TERMINFO"),
+        "/usr/share/terminfo",
+        "/lib/terminfo",
+        "/etc/terminfo",
+        "/usr/local/share/terminfo",
+        "/opt/homebrew/Cellar",
+    ]
+    for d in os.environ.get("TERMINFO_DIRS", "").split(":"):
+        if d:
+            roots.append(d)
+    first = name[0]
+    for root in roots:
+        if not root:
+            continue
+        for candidate in (
+            os.path.join(root, first, name),
+            os.path.join(root, name),
+        ):
+            if os.path.isfile(candidate):
+                return True
+    return False
+
+
+_TERM_CANDIDATES = (
+    "xterm-256color",
+    "xterm",
+    "screen-256color",
+    "screen",
+    "linux",
+    "vt100",
+    "ansi",
+    "dumb",
 )
+
+
+def _pick_term():
+    forced = os.environ.get("MAZVAL_TERM")
+    if forced and _terminfo_ok(forced):
+        return forced
+    for name in _TERM_CANDIDATES:
+        if _terminfo_ok(name):
+            return name
+    return "xterm"
+
+
+TERM_NAME = _pick_term()
+TERM_KNOWN = TERM_NAME != "xterm" or _terminfo_ok("xterm")
+
+BANNER_ENV = "VERCEL SANDBOX" if EPHEMERAL else "LOKAL/Termux"
+if PTY_AVAILABLE:
+    BANNER_MODE = "PTY KERNEL - terminal penuh seperti Termux (tty/jobs/stty jalan)"
+else:
+    BANNER_MODE = (
+        "PIPE SHELL (runtime tanpa PTY) - echo/prompt ditangani readline"
+        if EPHEMERAL
+        else "PIPE SHELL - echo/prompt ditangani readline"
+    )
 BANNER_STORE = "PERMANEN - TERSIMPAN DI CLOUD" if EPHEMERAL else "PERMANENT STORAGE"
 
 _RC_CONTENT = f"""set +H
 HISTSIZE=5000
+HISTFILESIZE=10000
 HISTFILE={HIST_PATH}
 shopt -s histappend 2>/dev/null
-PS1='\\e[1;35mmazval-term\\e[0m:\\e[1;32m\\w\\e[0m\\$ '
+shopt -s checkwinsize 2>/dev/null
+PROMPT_COMMAND='history -a'
+PS1='\\[\\e[1;35m\\]mazval-term\\[\\e[0m\\]:\\[\\e[1;32m\\]\\w\\[\\e[0m\\]\\$ '
+bind 'set completion-ignore-case on' 2>/dev/null
+bind 'set show-all-if-ambiguous on' 2>/dev/null
+bind 'set completion-map-case on' 2>/dev/null
 alias ls='ls --color=auto'
 command -v clear >/dev/null 2>&1 || alias clear='printf "\\033[H\\033[2J"'
 cd "{STORAGE_DIR}" || cd /tmp
@@ -54,12 +173,16 @@ printf '\\e[1;35m==================================================\\e[0m\\n'
 printf '\\e[1;32m[OK] env        : {BANNER_ENV}\\e[0m\\n'
 printf '\\e[1;32m[OK] mode       : {BANNER_MODE}\\e[0m\\n'
 printf '\\e[1;32m[OK] storage    : {BANNER_STORE}\\e[0m\\n'
+printf '\\e[1;32m[OK] term       : {TERM_NAME}\\e[0m\\n'
 printf '\\e[1;32m[OK] workdir    : %s\\e[0m\\n' "$(pwd)"
 printf '\\n'
 """
 
-with open(RC_PATH, "w") as _rc:
-    _rc.write(_RC_CONTENT)
+try:
+    with open(RC_PATH, "w") as _rc:
+        _rc.write(_RC_CONTENT)
+except OSError:
+    RC_PATH = "/dev/null"
 
 NOISE_PATTERNS = [
     re.compile(rb"bash: cannot set terminal process group[^\n]*\n"),
@@ -68,6 +191,18 @@ NOISE_PATTERNS = [
 
 SHELLS = {}
 SHELLS_LOCK = threading.Lock()
+
+
+def _clamp(value, low, high, default):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    if value < low:
+        return low
+    if value > high:
+        return high
+    return value
 
 
 def fmt_size(n):
@@ -445,74 +580,358 @@ def _part_path(sha):
     return None
 
 
+BASH_BIN = shutil.which("bash") or "/bin/bash"
+
+
+def _reset_child_signals():
+    """Paksa sinyal ke default di dalam shell anak.
+
+    Peluncur (nohup / & / pm2 / systemd) sering mewarisi SIGINT-SIGQUIT-SIGHUP
+    sebagai SIG_IGN. Atribut "ignored" melewati exec(), sehingga tanpa reset ini
+    Ctrl+C ^Z dan SIGHUP di terminal jadi TIDAK BEREFEK sama sekali.
+    """
+    for sig in (
+        signal.SIGHUP,
+        signal.SIGINT,
+        signal.SIGQUIT,
+        signal.SIGTERM,
+        signal.SIGPIPE,
+        signal.SIGUSR1,
+        signal.SIGUSR2,
+        signal.SIGTSTP,
+        signal.SIGTTIN,
+        signal.SIGTTOU,
+        signal.SIGWINCH,
+        signal.SIGCHLD,
+    ):
+        try:
+            signal.signal(sig, signal.SIG_DFL)
+        except Exception:
+            pass
+
+
+def _set_winsize(fd, cols, rows):
+    if fd is None or fcntl is None:
+        return False
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        return True
+    except Exception:
+        return False
+
+
 class ShellSession:
-    def __init__(self):
+    """Sesi shell interaktif.
+
+    Utama  : PTY penuh (openpty + controlling tty) -> identik Termux:
+             echo, prompt, history, tab-completion, job control (^Z/fg/bg),
+             stty, tput, vim/htop, SIGWINCH, semua jalan.
+    Cadangan: pipe stdin/stdout bila runtime tanpa PTY (mis. sandbox Vercel).
+    """
+
+    def __init__(self, cols=DEFAULT_COLS, rows=DEFAULT_ROWS):
         self.id = uuid.uuid4().hex[:16]
         self.created = time.time()
         self.last_active = time.time()
         self.chunks = queue.Queue()
+        self._buf_lock = threading.Lock()
+        self._buffered = 0
+        self._trimmed = False
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.cols = _clamp(cols, 20, 500, DEFAULT_COLS)
+        self.rows = _clamp(rows, 5, 200, DEFAULT_ROWS)
+        self.mode = "pipe"
+        self.master_fd = None
+        self.proc = None
+        self._closed = False
+        self.alive = True
+        self.spawn_error = ""
+        if PTY_AVAILABLE:
+            try:
+                if self._spawn_pty():
+                    self.mode = "pty"
+            except Exception as exc:
+                self.spawn_error = f"{type(exc).__name__}: {exc}"
+        if self.mode != "pty":
+            try:
+                self._spawn_pipe()
+            except Exception as exc:
+                self.alive = False
+                self.spawn_error = f"{type(exc).__name__}: {exc}"
+                self.chunks.put(None)
+                return
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _env(self):
         env = os.environ.copy()
         env.update(
             {
-                "TERM": "xterm-256color",
+                "TERM": TERM_NAME,
                 "PYTHONUNBUFFERED": "1",
                 "HOME": "/tmp",
                 "HISTFILE": HIST_PATH,
-                "PS1": r"\e[1;35mmazval-term\e[0m:\e[1;32m\w\e[0m\$ ",
+                "COLUMNS": str(self.cols),
+                "LINES": str(self.rows),
+                "PS1": r"\[\e[1;35m\]mazval-term\[\e[0m\]:\[\e[1;32m\]\w\[\e[0m\]\$ ",
             }
         )
+        return env
+
+    def _spawn_pty(self):
+        if pty is None:
+            return False
+        master = slave = None
+        try:
+            master, slave = pty.openpty()
+            _set_winsize(master, self.cols, self.rows)
+
+            def _child_setup():
+                os.setsid()
+                try:
+                    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+                except Exception:
+                    pass
+                _reset_child_signals()
+
+            self.proc = subprocess.Popen(
+                [BASH_BIN, "--rcfile", RC_PATH, "-i"],
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                cwd=STORAGE_DIR,
+                env=self._env(),
+                preexec_fn=_child_setup,
+                close_fds=True,
+                bufsize=0,
+            )
+            os.close(slave)
+            slave = None
+            flags = fcntl.fcntl(master, fcntl.F_GETFL)
+            fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            self.master_fd = master
+            master = None
+            _set_winsize(self.master_fd, self.cols, self.rows)
+            return True
+        except Exception:
+            if self.proc is not None:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+                self.proc = None
+            return False
+        finally:
+            for fd in (master, slave):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+    def _spawn_pipe(self):
         self.proc = subprocess.Popen(
-            ["/bin/bash", "--rcfile", RC_PATH, "-i"],
+            [BASH_BIN, "--rcfile", RC_PATH, "-i"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=STORAGE_DIR,
-            env=env,
+            env=self._env(),
             start_new_session=True,
+            preexec_fn=_reset_child_signals,
             bufsize=0,
         )
-        self.alive = True
-        threading.Thread(target=self._reader, daemon=True).start()
 
     def _reader(self):
-        received = 0
         try:
-            while True:
-                data = self.proc.stdout.read(4096)
-                if not data:
-                    break
-                if received < 4096:
-                    for pat in NOISE_PATTERNS:
-                        data = pat.sub(b"", data)
-                    received += len(data)
-                if data:
-                    self.chunks.put(data.decode("utf-8", "replace"))
+            if self.mode == "pty":
+                self._read_pty()
+            else:
+                self._read_pipe()
+            rest = self._decoder.decode(b"", True)
+            if rest:
+                self._push(rest)
         finally:
             self.alive = False
-            try:
-                self.proc.wait(timeout=5)
-            except Exception:
-                pass
+            if self.proc is not None:
+                try:
+                    self.proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
             self.chunks.put(None)
 
+    def _read_pipe(self):
+        received = 0
+        stream = self.proc.stdout
+        while True:
+            data = stream.read(4096)
+            if not data:
+                break
+            if received < 4096:
+                for pat in NOISE_PATTERNS:
+                    data = pat.sub(b"", data)
+                received += len(data)
+            if data:
+                self._push(self._decoder.decode(data))
+
+    def _read_pty(self):
+        fd = self.master_fd
+        while True:
+            try:
+                ready, _, _ = select.select([fd], [], [], 1.0)
+            except (ValueError, OSError):
+                break
+            if not ready:
+                continue
+            try:
+                data = os.read(fd, 8192)
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                break
+            if not data:
+                break
+            self._push(self._decoder.decode(data))
+
+    def _push(self, text):
+        if not text:
+            return
+        q = self.chunks
+        with self._buf_lock:
+            if self._trimmed:
+                text = "\r\n[OUTPUT TRIMMED - buffer penuh]\r\n" + text
+                self._trimmed = False
+            q.put(text)
+            self._buffered += len(text)
+            while self._buffered > MAX_BUFFER:
+                try:
+                    old = q.get_nowait()
+                except queue.Empty:
+                    break
+                if old is None:
+                    try:
+                        q.put_nowait(None)
+                    except queue.Full:
+                        pass
+                    break
+                self._buffered -= len(old)
+                self._trimmed = True
+
     def send(self, text):
-        if not self.alive or self.proc.stdin is None:
+        if not self.alive or self._closed:
             raise RuntimeError("shell sudah berakhir")
-        self.proc.stdin.write(text.encode("utf-8", "replace"))
-        self.proc.stdin.flush()
+        data = text.encode("utf-8", "replace")
         self.last_active = time.time()
+        if self.mode == "pty":
+            self._write_all(data)
+            return
+        stdin = self.proc.stdin if self.proc else None
+        if stdin is None:
+            raise RuntimeError("shell sudah berakhir")
+        stdin.write(data)
+        stdin.flush()
+
+    def _write_all(self, data, timeout=10.0):
+        fd = self.master_fd
+        if fd is None:
+            raise RuntimeError("shell sudah berakhir")
+        deadline = time.time() + timeout
+        view = memoryview(data)
+        while view:
+            if time.time() > deadline:
+                raise RuntimeError("shell tidak merespons input")
+            try:
+                written = os.write(fd, view)
+            except BlockingIOError:
+                try:
+                    select.select([], [fd], [], 0.2)
+                except (ValueError, OSError):
+                    raise RuntimeError("shell sudah berakhir")
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                raise RuntimeError("shell sudah berakhir")
+            if written <= 0:
+                raise RuntimeError("shell sudah berakhir")
+            view = view[written:]
 
     def interrupt(self):
-        if self.alive:
+        self.last_active = time.time()
+        if not self.alive:
+            return
+        if self.mode == "pty":
             try:
-                os.killpg(self.proc.pid, signal.SIGINT)
-            except (ProcessLookupError, PermissionError):
+                # Ketik ^C asli: line-discipline tty yang mengirim SIGINT,
+                # sama persis dengan menekan Ctrl+C di Termux.
+                self._write_all(b"\x03", timeout=2.0)
+                return
+            except Exception:
                 pass
-            self.last_active = time.time()
+            try:
+                fg = os.tcgetpgrp(self.master_fd)
+                if fg and fg != os.getpgrp():
+                    os.killpg(fg, signal.SIGINT)
+                    return
+            except Exception:
+                pass
+        try:
+            os.killpg(self.proc.pid, signal.SIGINT)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    def resize(self, cols, rows):
+        self.cols = _clamp(cols, 20, 500, self.cols)
+        self.rows = _clamp(rows, 5, 200, self.rows)
+        self.last_active = time.time()
+        if self.mode != "pty" or self.master_fd is None:
+            return False
+        return _set_winsize(self.master_fd, self.cols, self.rows)
+
+    def info(self):
+        return {
+            "id": self.id,
+            "mode": self.mode,
+            "term": TERM_NAME,
+            "cols": self.cols,
+            "rows": self.rows,
+            "ephemeral": EPHEMERAL,
+            "alive": self.alive,
+            "age": int(time.time() - self.created),
+        }
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self.alive = False
+        if self.proc is not None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGHUP)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            stdin = self.proc.stdin
+            if stdin is not None:
+                try:
+                    stdin.close()
+                except Exception:
+                    pass
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
         try:
-            self.proc.kill()
+            self.chunks.put_nowait(None)
         except Exception:
             pass
 
@@ -539,26 +958,48 @@ def index():
 
 @app.get("/api/probe")
 def probe():
+    try:
+        pyver = (
+            subprocess.run(
+                ["python3", "--version"], capture_output=True, text=True, timeout=5
+            ).stdout.strip()
+            or subprocess.run(
+                ["python3", "--version"], capture_output=True, text=True, timeout=5
+            ).stderr.strip()
+        )
+    except Exception as exc:
+        pyver = f"ERR {type(exc).__name__}"
+    modes = {"pty": 0, "pipe": 0}
+    for s in SHELLS.values():
+        modes[s.mode] = modes.get(s.mode, 0) + 1
     info = {
-        "python": subprocess.run(
-            ["python3", "--version"], capture_output=True, text=True
-        ).stdout.strip()
-        or "unknown",
-        "bash": shutil.which("bash"),
-        "clear": shutil.which("clear"),
+        "python_version": pyver,
         "python": shutil.which("python"),
         "python3": shutil.which("python3"),
+        "bash": shutil.which("bash"),
+        "bash_bin": BASH_BIN,
+        "clear": shutil.which("clear"),
+        "shell_mode": SHELL_MODE,
+        "pty_available": PTY_AVAILABLE,
+        "pty_import_error": _PTY_IMPORT_ERROR or None,
+        "pty_live": _pty_works(),
         "dev_ptmx": os.path.exists("/dev/ptmx"),
+        "term": TERM_NAME,
+        "term_ok": TERM_KNOWN,
+        "instance": INSTANCE_ID,
+        "ephemeral": EPHEMERAL,
+        "durable": DURABLE,
         "tmpdir": os.environ.get("TMPDIR", "/tmp"),
         "vercel_env": os.environ.get("VERCEL"),
         "cwd": os.getcwd(),
         "cwd_writable": os.access(os.getcwd(), os.W_OK),
         "tmp_writable": os.access(os.environ.get("TMPDIR", "/tmp"), os.W_OK),
         "shells_active": len(SHELLS),
+        "shells_by_mode": modes,
     }
     try:
         p = subprocess.run(
-            ["/bin/bash", "-c", "echo BASH_PIPE_OK"],
+            [BASH_BIN, "-c", "echo BASH_PIPE_OK"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -566,35 +1007,29 @@ def probe():
         info["bash_pipe"] = p.stdout.strip()
     except Exception as e:
         info["bash_pipe"] = f"ERR {type(e).__name__}: {e}"
-    try:
-        import pty
-        import struct
-        import fcntl
-        import termios
-
-        pid, fd = pty.fork()
-        if pid == 0:
-            os.write(1, b"PTY_OK\n")
-            os._exit(0)
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-        buf = os.read(fd, 64)
-        info["pty_fork"] = True
-        info["pty_read"] = buf.decode(errors="ignore").strip()
-        os.close(fd)
-        os.waitpid(pid, 0)
-    except Exception as e:
-        info["pty_fork"] = False
-        info["pty_error"] = f"{type(e).__name__}: {e}"
     return info
 
 
+async def _body(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    return body if isinstance(body, dict) else {}
+
+
 @app.post("/api/shell")
-def shell_open():
+async def shell_open(request: Request):
+    body = await _body(request)
+    cols = _clamp(body.get("cols"), 20, 500, DEFAULT_COLS)
+    rows = _clamp(body.get("rows"), 5, 200, DEFAULT_ROWS)
     prune_shells()
     with SHELLS_LOCK:
-        s = ShellSession()
+        s = ShellSession(cols, rows)
         SHELLS[s.id] = s
-    return {"id": s.id, "ephemeral": EPHEMERAL}
+    out = s.info()
+    out["spawn_error"] = s.spawn_error or None
+    return out
 
 
 @app.get("/api/shell/{sid}")
@@ -602,7 +1037,28 @@ def shell_ping(sid: str):
     s = SHELLS.get(sid)
     if s is None:
         return JSONResponse({"error": "session_expired"}, status_code=404)
-    return {"alive": s.alive, "age": int(time.time() - s.created)}
+    return s.info()
+
+
+@app.get("/api/shell/{sid}/ping")
+def shell_ping_alias(sid: str):
+    return shell_ping(sid)
+
+
+@app.post("/api/shell/{sid}/resize")
+async def shell_resize(sid: str, request: Request):
+    s = SHELLS.get(sid)
+    if s is None:
+        return JSONResponse({"error": "session_expired"}, status_code=404)
+    body = await _body(request)
+    resized = s.resize(body.get("cols", s.cols), body.get("rows", s.rows))
+    return {
+        "ok": True,
+        "resized": resized,
+        "mode": s.mode,
+        "cols": s.cols,
+        "rows": s.rows,
+    }
 
 
 @app.get("/api/shell/{sid}/stream")
@@ -616,6 +1072,7 @@ def shell_stream(sid: str):
     def gen():
         ended_reason = None
         while True:
+            s.last_active = time.time()
             if time.time() > deadline:
                 ended_reason = "timeout"
                 break
@@ -649,20 +1106,28 @@ async def shell_input(sid: str, request: Request):
     s = SHELLS.get(sid)
     if s is None:
         return JSONResponse({"error": "session_expired"}, status_code=404)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body = await _body(request)
     data = body.get("data", "")
-    if not isinstance(data, str) or not data:
-        return {"ok": True}
-    if len(data) > 8192:
-        data = data[:8192]
+    if not isinstance(data, str):
+        data = "" if data is None else str(data)
+    encoded = body.get("b64")
+    if isinstance(encoded, str) and encoded:
+        try:
+            pad = "=" * (-len(encoded) % 4)
+            data = base64.b64decode(encoded + pad).decode("utf-8", "replace")
+        except Exception:
+            return JSONResponse({"error": "b64 tidak valid"}, status_code=400)
+    if not data:
+        return {"ok": True, "mode": s.mode}
+    if len(data) > MAX_INPUT:
+        data = data[:MAX_INPUT]
+    if not s.alive:
+        return JSONResponse({"error": "session_expired"}, status_code=404)
     try:
         s.send(data)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-    return {"ok": True}
+    return {"ok": True, "mode": s.mode}
 
 
 @app.post("/api/shell/{sid}/interrupt")
@@ -670,8 +1135,10 @@ def shell_interrupt(sid: str):
     s = SHELLS.get(sid)
     if s is None:
         return JSONResponse({"error": "session_expired"}, status_code=404)
+    if not s.alive:
+        return JSONResponse({"error": "session_expired"}, status_code=404)
     s.interrupt()
-    return {"ok": True}
+    return {"ok": True, "mode": s.mode}
 
 
 @app.delete("/api/shell/{sid}")
@@ -1072,7 +1539,7 @@ HTML = f"""<!DOCTYPE html>
             <div class="terminal-window">
                 <div class="window-header">
                     <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-                    <span style="margin-left: 5px; font-size: 0.75rem; font-weight: 900; color: #000;">PIPE SHELL KERNEL (PTY-FREE)</span>
+                    <span id="kernelLabel" style="margin-left: 5px; font-size: 0.75rem; font-weight: 900; color: #000;">KERNEL SYNC...</span>
                 </div>
                 <div id="terminal-container"></div>
                 <div id="mobile-bar">
@@ -1181,25 +1648,56 @@ HTML = f"""<!DOCTYPE html>
         window.addEventListener('resize', () => fitAddon.fit());
 
         let shellId = null;
+        let shellMode = 'pipe';
         let evSource = null;
         let inputBuf = '';
         let flushTimer = null;
         let opening = false;
+        let resizeTimer = null;
 
         function setStatus(txt, online) {{
             statusEl.innerText = txt;
             statusEl.className = 'status' + (online ? ' online' : '');
         }}
 
+        function setKernel(mode) {{
+            const el = document.getElementById('kernelLabel');
+            if (!el) return;
+            el.innerText = (mode === 'pty')
+                ? 'PTY KERNEL - TERMUX MODE PENUH (tty / jobs / stty / vim)'
+                : 'PIPE SHELL KERNEL (runtime tanpa PTY)';
+        }}
+
+        function sendResize() {{
+            if (!shellId) return;
+            fetch('/api/shell/' + shellId + '/resize', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ cols: term.cols || 120, rows: term.rows || 40 }})
+            }}).catch(() => {{}});
+        }}
+
+        term.onResize(() => {{
+            if (!shellId) return;
+            if (resizeTimer) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {{ resizeTimer = null; sendResize(); }}, 150);
+        }});
+
         async function openShell() {{
             if (opening || shellId) return;
             opening = true;
             try {{
-                const res = await fetch('/api/shell', {{ method: 'POST' }});
+                const res = await fetch('/api/shell', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ cols: term.cols || 120, rows: term.rows || 40 }})
+                }});
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 const data = await res.json();
                 if (!data.id) throw new Error('no session id');
                 shellId = data.id;
+                shellMode = data.mode || 'pipe';
+                setKernel(shellMode);
                 connectStream();
                 setStatus('ONLINE', true);
             }} catch (e) {{
@@ -1227,13 +1725,16 @@ HTML = f"""<!DOCTYPE html>
                             setTimeout(openShell, 500);
                         }};
                         if (!keepSid) {{ restart(); return; }}
-                        fetch('/api/shell/' + keepSid + '/ping')
+                        fetch('/api/shell/' + keepSid)
                             .then(r => r.status === 200 ? r.json() : null)
                             .then(j => {{
                                 if (j && j.alive) {{
                                     shellId = keepSid;
+                                    shellMode = j.mode || shellMode;
+                                    setKernel(shellMode);
                                     term.write('\\r\\n[STREAM] menyambung ulang...\\r\\n');
                                     connectStream();
+                                    sendResize();
                                 }} else {{
                                     restart();
                                 }}
@@ -1245,7 +1746,7 @@ HTML = f"""<!DOCTYPE html>
             evSource.onerror = async () => {{
                 if (!shellId) return;
                 try {{
-                    const r = await fetch('/api/shell/' + shellId + '/ping');
+                    const r = await fetch('/api/shell/' + shellId);
                     if (r.status === 404) {{
                         if (evSource) {{ evSource.close(); evSource = null; }}
                         shellId = null;
@@ -1288,10 +1789,13 @@ HTML = f"""<!DOCTYPE html>
         async function flushInput() {{
             flushTimer = null;
             if (!shellId) return;
-            if (inputBuf) {{
-                const payload = inputBuf;
-                inputBuf = '';
-                await postInput(payload, 0);
+            if (!inputBuf) return;
+            const payload = inputBuf;
+            inputBuf = '';
+            const SLICE = 4000;
+            for (let i = 0; i < payload.length; i += SLICE) {{
+                await postInput(payload.slice(i, i + SLICE), 0);
+                if (!shellId) break;
             }}
         }}
 
@@ -1300,14 +1804,27 @@ HTML = f"""<!DOCTYPE html>
             if (!flushTimer) flushTimer = setTimeout(flushInput, 50);
         }}
 
+        function sendInterrupt() {{
+            if (!shellId) return;
+            if (shellMode === 'pty') {{
+                queueInput('\\x03');
+                flushInput();
+                return;
+            }}
+            term.write('^C\\r\\n');
+            fetch('/api/shell/' + shellId + '/interrupt', {{ method: 'POST' }}).catch(() => {{}});
+        }}
+
         term.onData((data) => {{
             if (!shellId) {{ openShell(); return; }}
             if (data === '\\x03') {{
-                term.write('^C\\r\\n');
-                fetch('/api/shell/' + shellId + '/interrupt', {{ method: 'POST' }});
+                sendInterrupt();
                 return;
             }}
-            if (data === '\\x0c') {{ term.clear(); return; }}
+            if (data === '\\x0c' && shellMode !== 'pty') {{
+                term.clear();
+                return;
+            }}
             queueInput(data);
             if (data.includes('\\r') || data.includes('\\n')) {{
                 if (flushTimer) {{ clearTimeout(flushTimer); flushTimer = null; }}
@@ -1316,10 +1833,12 @@ HTML = f"""<!DOCTYPE html>
         }});
 
         function sendCommand(cmd) {{ if (shellId) {{ queueInput(cmd); flushInput(); }} term.focus(); }}
-        function sendSpecial(key) {{ if (key === '\\x03') {{
-            term.write('^C\\r\\n');
-            if (shellId) fetch('/api/shell/' + shellId + '/interrupt', {{ method: 'POST' }});
-        }} else if (shellId) {{ queueInput(key); flushInput(); }} term.focus(); }}
+        function sendSpecial(key) {{
+            if (!shellId) {{ openShell(); return; }}
+            if (key === '\\x03') {{ sendInterrupt(); }}
+            else {{ queueInput(key); flushInput(); }}
+            term.focus();
+        }}
 
         function applyStorageUI(storage) {{
             const pct = Math.min(storage.percent, 100);

@@ -1,4 +1,5 @@
 import os, sys, subprocess, pty, gc, urllib.parse, shutil, mimetypes
+import codecs, errno, fcntl, json, select, signal, struct, termios, time
 
 # ==========================================
 # 1. AUTO-INSTALLER TORNADO SERVER
@@ -6,9 +7,35 @@ import os, sys, subprocess, pty, gc, urllib.parse, shutil, mimetypes
 try:
     import tornado.ioloop, tornado.web, tornado.websocket, tornado.httpserver
 except ImportError:
-    print("⏳ Menginstal Tornado Server...")
-    os.system(f"{sys.executable} -m pip install tornado -q")
-    import tornado.ioloop, tornado.web, tornado.websocket, tornado.httpserver
+    print("⏳ Tornado belum terpasang -> menginstal otomatis...")
+    import subprocess
+
+    _INSTALL_CMDS = (
+        [sys.executable, "-m", "pip", "install", "--quiet", "tornado"],
+        ["python3", "-m", "pip", "install", "--quiet", "tornado"],
+        ["python", "-m", "pip", "install", "--quiet", "tornado"],
+        ["pip", "install", "--quiet", "tornado"],
+        ["pkg", "install", "-y", "python-tornado"],
+        ["apt-get", "install", "-y", "python3-tornado"],
+    )
+    for _cmd in _INSTALL_CMDS:
+        try:
+            subprocess.run(_cmd, timeout=300, check=False)
+            import tornado.ioloop, tornado.web, tornado.websocket, tornado.httpserver
+
+            print("✅ Tornado siap dipakai.")
+            break
+        except Exception:
+            continue
+    else:
+        try:
+            import tornado.ioloop, tornado.web, tornado.websocket, tornado.httpserver
+        except ImportError:
+            sys.exit(
+                "[!] Gagal memasang tornado.\n"
+                "    Jalankan dulu:  pip install tornado\n"
+                "    Atau (Termux): pkg install python-tornado"
+            )
 
 # ==========================================
 # 2. TERMUX ENVIRONMENT & PORT CLEANER
@@ -52,6 +79,13 @@ with open(BASH_RC_PATH, "w") as f:
     f.write(r'''
 [ -f /data/data/com.termux/files/usr/etc/bash.bashrc ] && source /data/data/com.termux/files/usr/etc/bash.bashrc
 set +H
+HISTSIZE=5000
+HISTFILESIZE=10000
+shopt -s histappend 2>/dev/null
+shopt -s checkwinsize 2>/dev/null
+PROMPT_COMMAND='history -a'
+bind 'set completion-ignore-case on' 2>/dev/null
+bind 'set show-all-if-ambiguous on' 2>/dev/null
 cd "''' + PERMANENT_STORAGE_DIR + r'''"
 export PS1='\[\e[1;35m\]storage-term\[\e[0m\]:\[\e[1;32m\]\w\[\e[0m\]\$ '
 alias ls='ls --color=auto'
@@ -59,6 +93,7 @@ clear
 echo -e "\e[1;35m==================================================\e[0m"
 echo -e "\e[1;37m        STORAGE TERMINAL KERNEL ACTIVE            \e[0m"
 echo -e "\e[1;35m==================================================\e[0m"
+echo -e "\e[1;32m[✔] PTY Mode       : TERMUX PENUH (tty/jobs/stty/vim)\e[0m"
 echo -e "\e[1;32m[✔] Working Directory: $(pwd)\e[0m"
 echo -e "\e[1;33m[✔] Pool Kapasitas   : 400.0 TB Virtual\e[0m\n"
 ''')
@@ -347,15 +382,74 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
         window.addEventListener('resize', () => fitAddon.fit());
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(protocol + '//' + window.location.host + '/ws');
+        let ws = null;
+        let resizeTimer = null;
+        let retries = 0;
 
-        ws.onopen = () => {{ statusEl.innerText = "ONLINE"; statusEl.className = "status online"; term.focus(); }};
-        ws.onmessage = (e) => term.write(e.data);
-        ws.onclose = () => {{ statusEl.innerText = "OFFLINE"; statusEl.className = "status"; }};
-        term.onData((data) => {{ if (ws.readyState === WebSocket.OPEN) ws.send(data); }});
+        function setStatus(txt, online) {{
+            statusEl.innerText = txt;
+            statusEl.className = 'status' + (online ? ' online' : '');
+        }}
 
-        function sendCommand(cmd) {{ if (ws.readyState === WebSocket.OPEN) {{ ws.send(cmd); term.focus(); }} }}
-        function sendSpecial(key) {{ if (ws.readyState === WebSocket.OPEN) {{ ws.send(key); term.focus(); }} }}
+        function sendResize() {{
+            if (ws && ws.readyState === WebSocket.OPEN) {{
+                ws.send(JSON.stringify({{ type: 'resize', cols: term.cols || 120, rows: term.rows || 40 }}));
+            }}
+        }}
+
+        term.onResize(() => {{
+            if (resizeTimer) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {{ resizeTimer = null; sendResize(); }}, 150);
+        }});
+
+        function connectWS() {{
+            const old = ws;
+            ws = null;
+            if (old) {{ try {{ old.close(); }} catch (e) {{}} }}
+            const socket = new WebSocket(protocol + '//' + location.host + '/ws');
+            ws = socket;
+            socket.onopen = () => {{
+                if (socket !== ws) {{ try {{ socket.close(); }} catch (e) {{}} return; }}
+                retries = 0;
+                setStatus('ONLINE', true);
+                sendResize();
+                term.focus();
+            }};
+            socket.onmessage = (e) => {{
+                if (socket !== ws) return;
+                const data = e.data;
+                if (typeof data === 'string' && data.startsWith('{{"type"')) {{
+                    try {{
+                        const msg = JSON.parse(data);
+                        if (msg.type === 'exit') {{
+                            term.write('\\r\\n[SESI TUTUP] membuka shell baru...\\r\\n');
+                            setStatus('SYNC...', false);
+                            setTimeout(connectWS, 700);
+                            return;
+                        }}
+                        if (msg.type === 'error') {{
+                            term.write('\\r\\n[ERROR] ' + (msg.message || 'gagal menjalankan shell') + '\\r\\n');
+                            setStatus('ERROR', false);
+                            return;
+                        }}
+                    }} catch (err) {{}}
+                }}
+                term.write(data);
+            }};
+            socket.onclose = () => {{
+                if (socket !== ws) return;
+                retries++;
+                setStatus('RETRY...', false);
+                setTimeout(connectWS, Math.min(6000, 1200 + retries * 400));
+            }};
+        }}
+
+        connectWS();
+
+        term.onData((data) => {{ if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); }});
+
+        function sendCommand(cmd) {{ if (ws && ws.readyState === WebSocket.OPEN) {{ ws.send(cmd); term.focus(); }} }}
+        function sendSpecial(key) {{ if (ws && ws.readyState === WebSocket.OPEN) {{ ws.send(key); term.focus(); }} }}
 
         function applyStorageUI(storage) {{
             const pct = storage.percent;
@@ -486,34 +580,280 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
 # ==========================================
 # 6. BACKEND HANDLERS (AUTO-CD PTY & RUNNER)
 # ==========================================
+DEFAULT_COLS = 120
+DEFAULT_ROWS = 40
+
+
+def _pick_term():
+    """Pilih TERM yang benar-benar tersedia di Termux (hindari tput: unknown terminal)."""
+    roots = [
+        os.environ.get("TERMINFO"),
+        os.path.join(PREFIX, "share", "terminfo"),
+        "/data/data/com.termux/files/usr/share/terminfo",
+        "/usr/share/terminfo",
+        "/lib/terminfo",
+    ]
+    for d in os.environ.get("TERMINFO_DIRS", "").split(":"):
+        if d:
+            roots.append(d)
+    for name in ("xterm-256color", "xterm", "screen-256color", "linux", "dumb"):
+        for root in roots:
+            if root and os.path.isfile(os.path.join(root, name[0], name)):
+                return name
+        if shutil.which("infocmp"):
+            try:
+                rc = subprocess.run(
+                    ["infocmp", "-1", name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                ).returncode
+                if rc == 0:
+                    return name
+            except Exception:
+                pass
+    return "xterm"
+
+
+TERM_NAME = _pick_term()
+
+
+def _set_winsize(fd, cols, rows):
+    if fd is None:
+        return False
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        return True
+    except Exception:
+        return False
+
+
+def _reset_child_signals():
+    """Paksa sinyal ke default di dalam shell anak.
+
+    Server yang dijalankan dengan nohup / & / pm2 sering mewarisi
+    SIGINT-SIGQUIT-SIGHUP sebagai SIG_IGN; atribut ignored melewati exec()
+    sehingga Ctrl+C, ^Z, dan SIGHUP jadi tidak berefek sama sekali.
+    """
+    for sig in (
+        signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM,
+        signal.SIGPIPE, signal.SIGUSR1, signal.SIGUSR2, signal.SIGTSTP,
+        signal.SIGTTIN, signal.SIGTTOU, signal.SIGWINCH, signal.SIGCHLD,
+    ):
+        try:
+            signal.signal(sig, signal.SIG_DFL)
+        except Exception:
+            pass
+
+
+def _clamp(value, low, high, default):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, value))
+
+
 class MainHandler(tornado.web.RequestHandler):
     def get(self): self.write(HTML_FRONTEND)
 
 class TerminalSocketHandler(tornado.websocket.WebSocketHandler):
-    def check_origin(self, origin): return True
-    def open(self):
-        self.pid, self.fd = pty.fork()
-        if self.pid == 0:
-            env = os.environ.copy()
-            env["TERM"] = "xterm-256color"
-            env["PYTHONUNBUFFERED"] = "1"  # Real-time python output without buffering
-            os.execve(TERMUX_BASH, ["bash", "--rcfile", BASH_RC_PATH, "-i"], env)
-        else:
-            tornado.ioloop.IOLoop.current().add_handler(self.fd, self.on_pty_read, tornado.ioloop.IOLoop.READ)
+    """Shell PTY penuh (echo, prompt, history, tab-completion, job control,
+    stty/tput, vim/htop, SIGWINCH) -> identik dengan terminal Termux."""
 
+    def check_origin(self, origin): return True
+
+    def open(self):
+        self.pid = None
+        self.fd = None
+        self.proc = None
+        self.cols = DEFAULT_COLS
+        self.rows = DEFAULT_ROWS
+        self._closing = False
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._spawn()
+
+    # --- lifecycle -------------------------------------------------------
+    def _spawn(self):
+        master = slave = None
+        try:
+            master, slave = pty.openpty()
+            _set_winsize(master, self.cols, self.rows)
+            env = os.environ.copy()
+            env.update({
+                "TERM": TERM_NAME,
+                "PYTHONUNBUFFERED": "1",
+                "COLUMNS": str(self.cols),
+                "LINES": str(self.rows),
+            })
+
+            def _child_setup():
+                os.setsid()
+                try:
+                    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+                except Exception:
+                    pass
+                _reset_child_signals()
+
+            self.proc = subprocess.Popen(
+                [TERMUX_BASH, "--rcfile", BASH_RC_PATH, "-i"],
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                cwd=PERMANENT_STORAGE_DIR,
+                env=env,
+                preexec_fn=_child_setup,
+                close_fds=True,
+                bufsize=0,
+            )
+            os.close(slave)
+            slave = None
+            self.fd = master
+            self.pid = self.proc.pid
+            master = None
+            flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+            fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            _set_winsize(self.fd, self.cols, self.rows)
+            tornado.ioloop.IOLoop.current().add_handler(
+                self.fd, self.on_pty_read, tornado.ioloop.IOLoop.READ
+            )
+        except Exception as exc:
+            self._control({"type": "error", "message": f"gagal menjalankan shell: {exc}"})
+        finally:
+            for fd in (master, slave):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+    def _detach(self):
+        """Lepas PTY dari loop dan pastikan anak proses benar-benar mati."""
+        if self.fd is not None:
+            try:
+                tornado.ioloop.IOLoop.current().remove_handler(self.fd)
+            except Exception:
+                pass
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, 1)  # SIGHUP: sama seperti menutup terminal
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+
+    def _shell_ended(self):
+        if self._closing:
+            return
+        self._closing = True
+        rest = ""
+        try:
+            rest = self._decoder.decode(b"", True)
+        except Exception:
+            rest = ""
+        if rest:
+            self._send(rest)
+        self._detach()
+        self._control({"type": "exit"})
+
+    # --- IO --------------------------------------------------------------
     def on_pty_read(self, fd, events):
         try:
-            data = os.read(fd, 1024)
-            if data: self.write_message(data.decode("utf-8", errors="ignore"))
-        except Exception: pass
+            data = os.read(fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                return
+            self._shell_ended()
+            return
+        if not data:
+            self._shell_ended()
+            return
+        try:
+            self._send(self._decoder.decode(data))
+        except Exception:
+            pass
+
+    def _send(self, text):
+        if not text:
+            return
+        try:
+            if self.ws_connection is not None:
+                self.write_message(text)
+        except Exception:
+            self._shell_ended()
+
+    def _control(self, obj):
+        try:
+            if self.ws_connection is not None:
+                self.write_message(json.dumps(obj))
+        except Exception:
+            pass
+
+    def _write_all(self, data, timeout=2.0):
+        if self.fd is None:
+            return False
+        deadline = time.time() + timeout
+        view = memoryview(data)
+        while view:
+            if time.time() > deadline:
+                return False
+            try:
+                written = os.write(self.fd, view)
+            except BlockingIOError:
+                try:
+                    select.select([], [self.fd], [], 0.1)
+                except Exception:
+                    return False
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                return False
+            view = view[written:]
+        return True
 
     def on_message(self, message):
-        if hasattr(self, 'fd'): os.write(self.fd, message.encode("utf-8"))
+        if message is None:
+            return
+        if isinstance(message, bytes):
+            try:
+                message = message.decode("utf-8", "replace")
+            except Exception:
+                return
+        if message.startswith('{"type"'):
+            try:
+                msg = json.loads(message)
+            except ValueError:
+                return
+            if not isinstance(msg, dict):
+                return
+            if msg.get("type") == "resize":
+                self.cols = _clamp(msg.get("cols"), 20, 500, self.cols)
+                self.rows = _clamp(msg.get("rows"), 5, 200, self.rows)
+                if self.fd is not None:
+                    _set_winsize(self.fd, self.cols, self.rows)
+            return
+        if self.fd is None:
+            return
+        self._write_all(message.encode("utf-8", "replace"))
 
     def on_close(self):
-        if hasattr(self, 'fd'):
-            tornado.ioloop.IOLoop.current().remove_handler(self.fd)
-            os.close(self.fd)
+        self._closing = True
+        self._detach()
 
 @tornado.web.stream_request_body
 class AntiRamUploadHandler(tornado.web.RequestHandler):
