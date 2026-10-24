@@ -111,6 +111,17 @@ Fallback:
 /data/data/com.termux/files/home/NEXUS_CLOUD_STORAGE
 ```
 
+## Tampilan Teks (rapi & presisi)
+
+Banner dan prompt dibangun supaya selalu rapi apa pun lebar layarnya:
+
+- Kotak banner **lebar 50 kolom, judul diketengahkan presisi** (padding kiri = kanan, dihitung otomatis dari `COLUMNS`; ikut mengecil di layar sempit, minimal 32 kolom).
+- Baris status memakai pola `[OK] %-12s : nilai` sehingga **kolon `:` selalu berada di kolom yang sama** di semua baris (env/mode/storage/term/workdir di `app.py`; mode/term/workdir/pool di `termux_server.py`) — label diseragamkan antara kedua entry point.
+- Layar dibersihkan (`\e[H\e[2J\e[3J`) tiap shell baru → sesi restart menampilkan banner segar, bukan tumpukan sisa teks lama.
+- Prompt Termux memakai `\W` (nama folder saja, contoh `storage-term:NEXUS_CLOUD_STORAGE#`) alih-alih path panjang; `app.py` tetap `\w` karena home-nya pendek (`~/mazval_storage`).
+- Alias standar: `ll`, `la`, `l`, `ls --color=auto`, `grep --color=auto` (dengan guard bila perintah tidak tersedia).
+- Font monospace stack (`Menlo/Monaco/DejaVu Sans Mono/Courier New`) + `lineHeight 1.15` supaya teks rapi dan tidak rapat.
+
 ## Pengujian
 
 Dua smoke-test suite (stdlib-only untuk `app.py`, butuh `tornado` untuk `termux_server.py`):

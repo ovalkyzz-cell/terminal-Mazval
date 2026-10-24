@@ -145,13 +145,15 @@ TERM_KNOWN = TERM_NAME != "xterm" or _terminfo_ok("xterm")
 
 BANNER_ENV = "VERCEL SANDBOX" if EPHEMERAL else "LOKAL/Termux"
 if PTY_AVAILABLE:
-    BANNER_MODE = "PTY KERNEL - terminal penuh seperti Termux (tty/jobs/stty jalan)"
+    BANNER_MODE = "PTY KERNEL - penuh seperti Termux"
 else:
     BANNER_MODE = (
-        "PIPE SHELL (runtime tanpa PTY) - echo/prompt ditangani readline"
+        "PIPE SHELL - fallback runtime tanpa PTY"
         if EPHEMERAL
-        else "PIPE SHELL - echo/prompt ditangani readline"
+        else "PIPE SHELL - echo/prompt dari readline"
     )
+BANNER_TITLE = "STORAGE TERMINAL KERNEL ACTIVE"
+BANNER_W = 50  # lebar kotak banner (judul diketengahkan presisi)
 BANNER_STORE = "PERMANEN - TERSIMPAN DI CLOUD" if EPHEMERAL else "PERMANENT STORAGE"
 
 _RC_CONTENT = f"""set +H
@@ -165,18 +167,37 @@ PS1='\\[\\e[1;35m\\]mazval-term\\[\\e[0m\\]:\\[\\e[1;32m\\]\\w\\[\\e[0m\\]\\$ '
 bind 'set completion-ignore-case on' 2>/dev/null
 bind 'set show-all-if-ambiguous on' 2>/dev/null
 bind 'set completion-map-case on' 2>/dev/null
-alias ls='ls --color=auto'
+if ls --color=auto / >/dev/null 2>&1; then
+    alias ls='ls --color=auto'
+    alias ll='ls -alF --color=auto'
+    alias la='ls -A --color=auto'
+fi
+alias l='ls -CF'
+printf x | grep --color=auto x >/dev/null 2>&1 && alias grep='grep --color=auto'
 command -v clear >/dev/null 2>&1 || alias clear='printf "\\033[H\\033[2J"'
 cd "{STORAGE_DIR}" || cd /tmp
 export PYTHONUNBUFFERED=1
-printf '\\e[1;35m==================================================\\e[0m\\n'
-printf '\\e[1;37m        STORAGE TERMINAL KERNEL ACTIVE            \\e[0m\\n'
-printf '\\e[1;35m==================================================\\e[0m\\n'
-printf '\\e[1;32m[OK] env        : {BANNER_ENV}\\e[0m\\n'
-printf '\\e[1;32m[OK] mode       : {BANNER_MODE}\\e[0m\\n'
-printf '\\e[1;32m[OK] storage    : {BANNER_STORE}\\e[0m\\n'
-printf '\\e[1;32m[OK] term       : {TERM_NAME}\\e[0m\\n'
-printf '\\e[1;32m[OK] workdir    : %s\\e[0m\\n' "$(pwd)"
+printf '\\e[H\\e[2J\\e[3J'
+__w={BANNER_W}
+[ -n "$COLUMNS" ] && [ "$COLUMNS" -lt {BANNER_W} ] && __w=$COLUMNS
+[ "$__w" -lt 32 ] && __w=32
+__sep=''; __i=0
+while [ $__i -lt $__w ]; do __sep="$__sep="; __i=$((__i+1)); done
+__n={len(BANNER_TITLE)}
+__l=$(( (__w - __n) / 2 )); [ $__l -lt 0 ] && __l=0
+__r=$(( __w - __n - __l )); [ $__r -lt 0 ] && __r=0
+__ls=''; __i=0
+while [ $__i -lt $__l ]; do __ls="$__ls "; __i=$((__i+1)); done
+__rs=''; __i=0
+while [ $__i -lt $__r ]; do __rs="$__rs "; __i=$((__i+1)); done
+printf '\\e[1;35m%s\\e[0m\\n' "$__sep"
+printf '\\e[1;37m%s{BANNER_TITLE}%s\\e[0m\\n' "$__ls" "$__rs"
+printf '\\e[1;35m%s\\e[0m\\n' "$__sep"
+printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "env" "{BANNER_ENV}"
+printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "mode" "{BANNER_MODE}"
+printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "storage" "{BANNER_STORE}"
+printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "term" "{TERM_NAME}"
+printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "workdir" "$(pwd)"
 printf '\\n'
 """
 
@@ -1660,7 +1681,7 @@ HTML = f"""<!DOCTYPE html>
         const statusEl = document.getElementById('status');
         const term = new Terminal({{
             cursorBlink: true, theme: {{ background: '#121212', foreground: '#06D6A0', cursor: '#FF5964' }},
-            fontFamily: 'monospace', fontSize: 13, padding: 5, scrollback: 5000
+            fontFamily: 'Menlo, Monaco, "DejaVu Sans Mono", "Courier New", monospace', fontSize: 13, lineHeight: 1.15, scrollback: 5000
         }});
         const fitAddon = new FitAddon.FitAddon();
         term.loadAddon(fitAddon);

@@ -87,15 +87,35 @@ PROMPT_COMMAND='history -a'
 bind 'set completion-ignore-case on' 2>/dev/null
 bind 'set show-all-if-ambiguous on' 2>/dev/null
 cd "''' + PERMANENT_STORAGE_DIR + r'''"
-export PS1='\[\e[1;35m\]storage-term\[\e[0m\]:\[\e[1;32m\]\w\[\e[0m\]\$ '
-alias ls='ls --color=auto'
-clear
-echo -e "\e[1;35m==================================================\e[0m"
-echo -e "\e[1;37m        STORAGE TERMINAL KERNEL ACTIVE            \e[0m"
-echo -e "\e[1;35m==================================================\e[0m"
-echo -e "\e[1;32m[✔] PTY Mode       : TERMUX PENUH (tty/jobs/stty/vim)\e[0m"
-echo -e "\e[1;32m[✔] Working Directory: $(pwd)\e[0m"
-echo -e "\e[1;33m[✔] Pool Kapasitas   : 400.0 TB Virtual\e[0m\n"
+export PS1='\[\e[1;35m\]storage-term\[\e[0m\]:\[\e[1;32m\]\W\[\e[0m\]\$ '
+if ls --color=auto / >/dev/null 2>&1; then
+    alias ls='ls --color=auto'
+    alias ll='ls -alF --color=auto'
+    alias la='ls -A --color=auto'
+fi
+alias l='ls -CF'
+printf x | grep --color=auto x >/dev/null 2>&1 && alias grep='grep --color=auto'
+printf '\e[H\e[2J\e[3J'
+__w=50
+[ -n "$COLUMNS" ] && [ "$COLUMNS" -lt 50 ] && __w=$COLUMNS
+[ "$__w" -lt 32 ] && __w=32
+__sep=''; __i=0
+while [ $__i -lt $__w ]; do __sep="$__sep="; __i=$((__i+1)); done
+__n=30
+__l=$(( (__w - __n) / 2 )); [ $__l -lt 0 ] && __l=0
+__r=$(( __w - __n - __l )); [ $__r -lt 0 ] && __r=0
+__ls=''; __i=0
+while [ $__i -lt $__l ]; do __ls="$__ls "; __i=$((__i+1)); done
+__rs=''; __i=0
+while [ $__i -lt $__r ]; do __rs="$__rs "; __i=$((__i+1)); done
+printf '\e[1;35m%s\e[0m\n' "$__sep"
+printf '\e[1;37m%sSTORAGE TERMINAL KERNEL ACTIVE%s\e[0m\n' "$__ls" "$__rs"
+printf '\e[1;35m%s\e[0m\n' "$__sep"
+printf '\e[1;32m[OK] %-12s : %s\e[0m\n' "mode" "TERMUX PENUH (tty/jobs/stty/vim)"
+printf '\e[1;32m[OK] %-12s : %s\e[0m\n' "term" "$TERM"
+printf '\e[1;32m[OK] %-12s : %s\e[0m\n' "workdir" "$(pwd)"
+printf '\e[1;32m[OK] %-12s : %s\e[0m\n' "pool" "400.0 TB Virtual"
+printf '\n'
 ''')
 
 # ==========================================
@@ -314,7 +334,7 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
                 </div>
                 <div class="upload-area">
                     <div style="font-size: 2rem; margin-bottom: 5px;">📥</div>
-                    <div style="font-weight: 900; font-size: 0.9rem;" id="fileNameDisplay">Pilih file python/video ke brankas...</div>
+                    <div style="font-weight: 900; font-size: 0.9rem;" id="fileNameDisplay">Pilih file ke brankas...</div>
                     <input type="file" id="fileInput" multiple onchange="updateFileName()">
                 </div>
                 <button class="brutal-btn btn-primary-color" style="width: 100%; padding: 12px; font-size: 0.9rem;" onclick="uploadFile()">UNGGAH SEKARANG</button>
@@ -358,7 +378,7 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
             if (input.files.length > 0) {{
                 display.innerText = input.files[0].name;
             }} else {{
-                display.innerText = "Pilih file python/video ke brankas...";
+                display.innerText = "Pilih file ke brankas...";
             }}
         }}
 
@@ -373,7 +393,7 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
         const statusEl = document.getElementById('status');
         const term = new Terminal({{
             cursorBlink: true, theme: {{ background: '#121212', foreground: '#06D6A0', cursor: '#FF5964' }},
-            fontFamily: 'monospace', fontSize: 13, padding: 5, scrollback: 5000
+            fontFamily: 'Menlo, Monaco, "DejaVu Sans Mono", "Courier New", monospace', fontSize: 13, lineHeight: 1.15, scrollback: 5000
         }});
         const fitAddon = new FitAddon.FitAddon();
         term.loadAddon(fitAddon);
@@ -559,7 +579,7 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
                 if (xhr.status === 200) {{
                     log.innerText += `\\n\\n[SUCCESS] File tersimpan di direktori terminal! Ketik 'ls' atau 'python ${{file.name}}' di terminal.`;
                     fileInput.value = "";
-                    document.getElementById('fileNameDisplay').innerText = "Pilih file python/video ke brankas...";
+                    document.getElementById('fileNameDisplay').innerText = "Pilih file ke brankas...";
                     setTimeout(() => {{ switchTab('gallery'); loadGallery(); }}, 1000);
                 }} else {{ log.innerText += `\\n\\n[ERROR] Gagal upload! Kode: ${{xhr.status}}`; }}
             }};
