@@ -122,19 +122,34 @@ Banner dan prompt dibangun supaya selalu rapi apa pun lebar layarnya:
 - Alias standar: `ll`, `la`, `l`, `ls --color=auto`, `grep --color=auto` (dengan guard bila perintah tidak tersedia).
 - Font monospace stack (`Menlo/Monaco/DejaVu Sans Mono/Courier New`) + `lineHeight 1.15` supaya teks rapi dan tidak rapat.
 
+## Menjalankan File Python & Skrip
+
+Upload lewat tab Storage lalu jalankan dari terminal — tiga cara, semuanya didukung:
+
+| Cara | Contoh | Keterangan |
+|---|---|---|
+| Interpreter | `python file.py` / `python3 file.py` | Selalu jalan. Bila `python` tidak ada, shell otomatis `alias python=python3`. |
+| Helper bawaan | `run file.py` / `run file.sh` | Pilih interpreter otomatis per ekstensi (`*.py` → python, `*.sh` → bash), argumen bebas (`run file.py arg1`). |
+| Eksekusi langsung | `./file.py` | File `.py`/`.sh` yang di-upload **otomatis diberi shebang + bit eksekusi** oleh server (bila belum punya `#!`). |
+
+Catatan:
+
+- Di `/storage/emulated/0` (FUSE Android) mount-nya **`noexec`** — `./file.py` akan bilang `Permission denied` **sama persis dengan Termux asli** pada media bersama; pakai `run file.py`/`python file.py` (atau salin ke `~` / `$PREFIX/tmp` yang exec-able). Kalimat `bad interpreter`/`required file not found` **tidak pernah muncul** karena shebang ditulis dengan path interpreter yang valid di runtime (dicek smoke test).
+- File `.sh`/`.bash` juga otomatis `bash`-able lewat `run`.
+
 ## Pengujian
 
 Dua smoke-test suite (stdlib-only untuk `app.py`, butuh `tornado` untuk `termux_server.py`):
 
 ```bash
-# engine mode PTY (harusnya 43/43) — jalankan server app.py dulu
+# engine mode PTY (harusnya 49/49) — jalankan server app.py dulu
 python3 tests/smoke_test.py http://127.0.0.1:8080
 
-# engine mode pipe / fallback Vercel (41/41)
+# engine mode pipe / fallback Vercel (47/47)
 MAZVAL_SHELL_MODE=pipe uvicorn app:app --port 8081 &
 python3 tests/smoke_test.py http://127.0.0.1:8081
 
-# termux_server.py (Tornado + PTY) — 20/20
+# termux_server.py (Tornado + PTY) — 27/27
 python tests/smoke_termux.py http://127.0.0.1:8080
 ```
 

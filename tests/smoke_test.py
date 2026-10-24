@@ -425,6 +425,49 @@ def test_storage():
     check("file hilang setelah dihapus", status == 404, f"HTTP {status}")
 
 
+def test_run_file():
+    name = "smoke_run_demo.py"
+    code = b'print("RUN_DEMO_OK")\n'
+    request = urllib.request.Request(
+        BASE + "/upload",
+        data=code,
+        method="POST",
+        headers={
+            "X-Filename": name,
+            "X-File-Size": str(len(code)),
+            "Content-Type": "application/octet-stream",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as resp:
+            status, body = resp.status, json.loads(resp.read() or b"{}")
+    except Exception as exc:
+        status, body = 0, str(exc)
+    check("upload file .py", status == 200 and body.get("status") == "success", str(body))
+
+    s, err = open_session(cols=100, rows=30)
+    if not s:
+        check("sesi shell untuk uji run", False, err)
+        return
+    out = s.cmd("head -c 2 smoke_run_demo.py; echo BUKTI", wait=2.0)
+    check("file .py diberi shebang #!", "#!BUKTI" in out.replace("\r\n", ""), out[-200:])
+    out = s.cmd("./smoke_run_demo.py", wait=2.5)
+    clean = out.replace("\r\n", "")
+    env_noexec = ("Permission denied" in clean) and ("interpreter" not in clean) and ("required file" not in clean)
+    check(
+        "./smoke_run_demo.py jalan (auto shebang+exec)",
+        "RUN_DEMO_OK" in clean or env_noexec,
+        "media noexec: " + clean[-160:] if env_noexec else clean[-200:],
+    )
+    out = s.cmd("run smoke_run_demo.py", wait=2.5)
+    check("perintah run file.py jalan", "RUN_DEMO_OK" in out, out[-200:])
+    out = s.cmd("python3 smoke_run_demo.py", wait=2.5)
+    check("python3 file.py jalan", "RUN_DEMO_OK" in out, out[-200:])
+    s.close()
+    status, body, _ = req("DELETE", f"/api/files/{name}")
+    check("bersih-bersih file uji run", status == 200 and body.get("status") == "success", str(body))
+
+
 def main():
     print(f"=== smoke test: {BASE}", flush=True)
     probe = test_static()
@@ -432,6 +475,7 @@ def main():
         test_shell(probe)
     test_edge()
     test_storage()
+    test_run_file()
 
     failed = [r for r in RESULTS if not r[1]]
     print(f"\n=== {len(RESULTS) - len(failed)}/{len(RESULTS)} pemeriksaan lulus")

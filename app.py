@@ -156,6 +156,39 @@ BANNER_TITLE = "STORAGE TERMINAL KERNEL ACTIVE"
 BANNER_W = 50  # lebar kotak banner (judul diketengahkan presisi)
 BANNER_STORE = "PERMANEN - TERSIMPAN DI CLOUD" if EPHEMERAL else "PERMANENT STORAGE"
 
+_RC_RUNFN = r'''
+command -v python >/dev/null 2>&1 || { command -v python3 >/dev/null 2>&1 && alias python=python3; }
+run() {
+    if [ -z "$1" ]; then
+        echo "usage: run <file.py|file.sh|program> [arg...]"
+        return 2
+    fi
+    if [ ! -e "$1" ]; then
+        echo "run: file tidak ditemukan: $1"
+        return 127
+    fi
+    case "$1" in
+        *.py)
+            if command -v python3 >/dev/null 2>&1; then python3 "$@"; return $?; fi
+            if command -v python >/dev/null 2>&1; then python "$@"; return $?; fi
+            if [ -x "$1" ]; then "$@"; return $?; fi
+            echo "run: interpreter python belum terpasang (pkg install python)"
+            return 127
+            ;;
+        *.sh|*.bash)
+            bash "$@"
+            return $?
+            ;;
+        *)
+            if [ -x "$1" ] && [ ! -d "$1" ]; then "$@"; return $?; fi
+            if command -v python3 >/dev/null 2>&1; then python3 "$@"; return $?; fi
+            echo "run: tidak ada interpreter untuk $1 (coba: bash \"$1\")"
+            return 126
+            ;;
+    esac
+}
+'''
+
 _RC_CONTENT = f"""set +H
 HISTSIZE=5000
 HISTFILESIZE=10000
@@ -175,6 +208,7 @@ fi
 alias l='ls -CF'
 printf x | grep --color=auto x >/dev/null 2>&1 && alias grep='grep --color=auto'
 command -v clear >/dev/null 2>&1 || alias clear='printf "\\033[H\\033[2J"'
+{_RC_RUNFN}
 cd "{STORAGE_DIR}" || cd /tmp
 export PYTHONUNBUFFERED=1
 printf '\\e[H\\e[2J\\e[3J'
@@ -1191,6 +1225,42 @@ def shell_close(sid: str):
     return {"ok": True}
 
 
+def _make_runnable(path):
+    """Buat file .py/.sh bisa langsung dieksekusi: auto shebang + exec bit."""
+    tmp_path = None
+    try:
+        if not os.path.isfile(path):
+            return False
+        ext = os.path.splitext(path)[1].lower()
+        with open(path, "rb") as f:
+            has_shebang = f.read(2) == b"#!"
+        if not has_shebang and ext in (".py", ".sh", ".bash"):
+            if ext == ".py":
+                prog = shutil.which("python3") or shutil.which("python")
+            else:
+                prog = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+            if prog:
+                tmp_path = path + ".run_tmp"
+                with open(path, "rb") as src_f, open(tmp_path, "wb") as dst:
+                    dst.write(b"#!" + prog.encode("utf-8") + b"\n")
+                    shutil.copyfileobj(src_f, dst, 1048576)
+                os.replace(tmp_path, path)
+                tmp_path = None
+                has_shebang = True
+        if has_shebang:
+            os.chmod(path, os.stat(path).st_mode | 0o111)
+            return True
+        return False
+    except Exception:
+        return False
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 @app.post("/upload")
 async def upload(request: Request):
     raw = request.headers.get("X-Filename", "upload.bin")
@@ -1213,12 +1283,15 @@ async def upload(request: Request):
             {"status": "error", "message": str(e)}, status_code=500
         )
     total = os.path.getsize(path)
+    try:
+        expect = int(request.headers.get("X-File-Size", "-1"))
+    except ValueError:
+        expect = -1
+    final = (not append) or (expect >= 0 and total >= expect)
+    if final:
+        await run_in_threadpool(_make_runnable, path)
     pushed = None
     if DURABLE:
-        try:
-            expect = int(request.headers.get("X-File-Size", "-1"))
-        except ValueError:
-            expect = -1
         if expect >= 0 and total == expect:
             try:
                 pushed = await run_in_threadpool(durable_push, name, path, total)
@@ -2072,7 +2145,7 @@ HTML = f"""<!DOCTYPE html>
 
             if (failed.length === 0) {{
                 const mb = (files.reduce((a, f) => a + f.size, 0) / 1048576).toFixed(2);
-                log.innerText = `[UPLOADING] 100% (${{mb}} MB total)\n[SUCCESS] Semua file TERSIMPAN PERMANEN di cloud! Ketik 'ls' di terminal atau buka tab Gallery.`;
+                log.innerText = `[UPLOADING] 100% (${{mb}} MB total)\n[SUCCESS] File TERSIMPAN PERMANEN! Jalankan: 'run file.py' / 'python file.py' / './file.py' di terminal, atau buka tab Gallery.`;
                 fileInput.value = "";
                 document.getElementById('fileNameDisplay').innerText = "Pilih file ke brankas...";
                 setTimeout(() => {{ switchTab('gallery'); loadGallery(); }}, 800);

@@ -95,6 +95,36 @@ if ls --color=auto / >/dev/null 2>&1; then
 fi
 alias l='ls -CF'
 printf x | grep --color=auto x >/dev/null 2>&1 && alias grep='grep --color=auto'
+command -v python >/dev/null 2>&1 || { command -v python3 >/dev/null 2>&1 && alias python=python3; }
+run() {
+    if [ -z "$1" ]; then
+        echo "usage: run <file.py|file.sh|program> [arg...]"
+        return 2
+    fi
+    if [ ! -e "$1" ]; then
+        echo "run: file tidak ditemukan: $1"
+        return 127
+    fi
+    case "$1" in
+        *.py)
+            if command -v python3 >/dev/null 2>&1; then python3 "$@"; return $?; fi
+            if command -v python >/dev/null 2>&1; then python "$@"; return $?; fi
+            if [ -x "$1" ]; then "$@"; return $?; fi
+            echo "run: interpreter python belum terpasang (pkg install python)"
+            return 127
+            ;;
+        *.sh|*.bash)
+            bash "$@"
+            return $?
+            ;;
+        *)
+            if [ -x "$1" ] && [ ! -d "$1" ]; then "$@"; return $?; fi
+            if command -v python3 >/dev/null 2>&1; then python3 "$@"; return $?; fi
+            echo "run: tidak ada interpreter untuk $1 (coba: bash \"$1\")"
+            return 126
+            ;;
+    esac
+}
 printf '\e[H\e[2J\e[3J'
 __w=50
 [ -n "$COLUMNS" ] && [ "$COLUMNS" -lt 50 ] && __w=$COLUMNS
@@ -577,7 +607,7 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
 
             xhr.onload = () => {{
                 if (xhr.status === 200) {{
-                    log.innerText += `\\n\\n[SUCCESS] File tersimpan di direktori terminal! Ketik 'ls' atau 'python ${{file.name}}' di terminal.`;
+                    log.innerText += `\\n\\n[SUCCESS] File tersimpan di direktori terminal! Jalankan: 'run ${{file.name}}' / 'python ${{file.name}}' / './${{file.name}}' di terminal.`;
                     fileInput.value = "";
                     document.getElementById('fileNameDisplay').innerText = "Pilih file ke brankas...";
                     setTimeout(() => {{ switchTab('gallery'); loadGallery(); }}, 1000);
@@ -728,6 +758,42 @@ def _clamp(value, low, high, default):
     except (TypeError, ValueError):
         return default
     return max(low, min(high, value))
+
+
+def _make_runnable(path):
+    """Buat file .py/.sh bisa langsung dieksekusi: auto shebang + exec bit."""
+    tmp_path = None
+    try:
+        if not os.path.isfile(path):
+            return False
+        ext = os.path.splitext(path)[1].lower()
+        with open(path, "rb") as f:
+            has_shebang = f.read(2) == b"#!"
+        if not has_shebang and ext in (".py", ".sh", ".bash"):
+            if ext == ".py":
+                prog = shutil.which("python3") or shutil.which("python")
+            else:
+                prog = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
+            if prog:
+                tmp_path = path + ".run_tmp"
+                with open(path, "rb") as src_f, open(tmp_path, "wb") as dst:
+                    dst.write(b"#!" + prog.encode("utf-8") + b"\n")
+                    shutil.copyfileobj(src_f, dst, 1048576)
+                os.replace(tmp_path, path)
+                tmp_path = None
+                has_shebang = True
+        if has_shebang:
+            os.chmod(path, os.stat(path).st_mode | 0o111)
+            return True
+        return False
+    except Exception:
+        return False
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 class MainHandler(tornado.web.RequestHandler):
@@ -1015,6 +1081,8 @@ class AntiRamUploadHandler(tornado.web.RequestHandler):
         try:
             if hasattr(self, 'file') and self.file:
                 self.file.close()
+            if getattr(self, "filepath", None):
+                _make_runnable(self.filepath)
             self.write({"status": "success"})
         except Exception as e:
             self.set_status(500)

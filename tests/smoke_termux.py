@@ -201,6 +201,73 @@ async def shell_tests(url):
     conn.close()
 
 
+async def run_file_tests(url):
+    from tornado.httpclient import HTTPRequest
+    from tornado.websocket import websocket_connect
+
+    name = "smoke_run_demo.py"
+    code = b'print("RUN_DEMO_OK")\n'
+    status, body, _ = http(
+        "POST",
+        "/upload",
+        data=code,
+        headers={"X-Filename": name, "Content-Type": "application/octet-stream"},
+    )
+    check("upload file .py", status == 200 and b"success" in body, body[:200].decode())
+
+    conn = await websocket_connect(HTTPRequest(url, connect_timeout=15))
+    buf = []
+
+    async def step(command, needle, timeout=8.0):
+        start = len(buf)
+        conn.write_message(command if command.endswith("\r") else command + "\r")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                msg = await asyncio.wait_for(
+                    conn.read_message(), timeout=max(0.1, deadline - time.time())
+                )
+            except asyncio.TimeoutError:
+                break
+            if msg is None:
+                break
+            if not is_control(msg):
+                buf.append(msg)
+            if needle in "".join(buf[start:]):
+                return True, "".join(buf[start:])
+        return False, "".join(buf[start:])
+
+    await wait_text(conn, "STORAGE TERMINAL KERNEL ACTIVE", 12, buf)
+
+    ok, text = await step("head -c 2 smoke_run_demo.py", "#!", 6)
+    check("file .py diberi shebang #!", ok, text[-250:])
+    ok, text = await step("./smoke_run_demo.py", "RUN_DEMO_OK", 8)
+    clean = text.replace("\r\n", "")
+    env_noexec = ("Permission denied" in clean) and ("interpreter" not in clean) and ("required file" not in clean)
+    check(
+        "./smoke_run_demo.py jalan (atau media noexec yang wajar)",
+        ok or env_noexec,
+        "media noexec: " + clean[-160:] if env_noexec else clean[-250:],
+    )
+    ok, text = await step(
+        'cp smoke_run_demo.py /tmp/rx_$$.py; chmod +x /tmp/rx_$$.py; /tmp/rx_$$.py; rm -f /tmp/rx_$$.py',
+        "RUN_DEMO_OK",
+        8,
+    )
+    check("shebang hasil auto-dieksekusi kernel (media exec)", ok, text[-250:])
+    ok, text = await step("run smoke_run_demo.py", "RUN_DEMO_OK", 8)
+    check("perintah run file.py jalan", ok, text[-250:])
+    ok, text = await step("python3 smoke_run_demo.py", "RUN_DEMO_OK", 8)
+    check("python3 file.py jalan", ok, text[-250:])
+
+    conn.write_message("exit\r")
+    await asyncio.sleep(1)
+    conn.close()
+
+    status, body, _ = http("DELETE", f"/api/files/{name}")
+    check("bersih-bersih file uji run", status == 200 and b"success" in body, body[:200].decode())
+
+
 def http_tests():
     status, body, _ = http("GET", "/")
     check("GET / -> 200 + UI", status == 200 and b"STORAGE TERMINAL" in body)
@@ -243,6 +310,7 @@ def main():
     http_tests()
     ws_url = BASE.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
     asyncio.run(shell_tests(ws_url))
+    asyncio.run(run_file_tests(ws_url))
 
     failed = [r for r in RESULTS if not r[1]]
     print(f"\n=== {len(RESULTS) - len(failed)}/{len(RESULTS)} pemeriksaan lulus")
