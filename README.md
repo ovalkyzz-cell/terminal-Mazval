@@ -116,18 +116,30 @@ Fallback:
 Dua smoke-test suite (stdlib-only untuk `app.py`, butuh `tornado` untuk `termux_server.py`):
 
 ```bash
-# engine mode PTY (harusnya 38/38) — jalankan server app.py dulu
+# engine mode PTY (harusnya 43/43) — jalankan server app.py dulu
 python3 tests/smoke_test.py http://127.0.0.1:8080
 
-# engine mode pipe / fallback Vercel (36/36)
+# engine mode pipe / fallback Vercel (41/41)
 MAZVAL_SHELL_MODE=pipe uvicorn app:app --port 8081 &
 python3 tests/smoke_test.py http://127.0.0.1:8081
 
-# termux_server.py (Tornado + PTY) — 14/14
+# termux_server.py (Tornado + PTY) — 20/20
 python tests/smoke_termux.py http://127.0.0.1:8080
 ```
 
-Cakupan: buka/tutup sesi, eksekusi perintah, `tty` (`/dev/pts` di mode pty), `stty size` + resize + bukti `SIGWINCH`, interrupt proses & proses CPU-bound, tab-completion, UTF-8 multibyte, deteksi exit, 404/edge case, sesi paralel, upload → list → download (utuh & Range 206) → delete.
+Cakupan: buka/tutup sesi, eksekusi perintah, `tty` (`/dev/pts` di mode pty), `stty size` + resize + bukti `SIGWINCH`, interrupt proses & proses CPU-bound, tab-completion, UTF-8 multibyte, deteksi exit, **output besar (batching)**, **teks mirip pesan kontrol tidak memutus sesi / input mirip JSON tetap jadi ketikan**, **urutan input cepat tidak tertukar**, **Ctrl+L**, 404/edge case, sesi paralel, upload → list → download (utuh & Range 206) → delete.
+
+## Kinerja (anti-lag) & Ketiadaan Bug
+
+| Lapisan | Mekanisme |
+|---|---|
+| Input | Micro-batch `0ms` (event dalam satu frame digabung, tanpa jeda 50ms) + **rantai promise FIFO** → urutan ketikan tidak pernah tertukar; latensi ketikan→echo terukur **median ~3,5 ms** (PTY lokal) |
+| Output server | Batch burst dalam 1 pesan SSE (maks 64 KB/64 chunk) — output ratusan ribu baris bukan ribuan request kecil; di WS PTY seluruh data yang tersedia disedot dalam satu event (maks 256 KB/event) |
+| Render klien | Antrean `requestAnimationFrame` + batas buffer 2 MB (di atas itu ditandai `[OUTPUT DILEWAT]`) → `seq`/`yes`/`cat` raksasa tidak membekukan UI |
+| Backpressure WS | Penghitung frame tertunda; klien tertinggal → output ditahan + penanda, bukan antrean tak terbatas |
+| IOLoop | Input PTY ditulis lewat antrean + thread penulis per koneksi, `send` di app.py di-offload ke threadpool → satu paste besar tidak memblokir request lain |
+| Kanal kontrol | Pesan kontrol WS = **frame biner** (`binary=True`), input user = frame teks → teks user tidak pernah bisa menyamar jadi kontrol (`echo '{"type":"exit"}'` aman), begitu pula sebaliknya |
+| Mobile | `visualViewport` (keyboard HP) → body ikut mengecil + `fit()` → terminal rapi, bukan tertutup keyboard; ketikan selama koneksi putus ditahan lalu dikirim begitu tersambung |
 
 ## Lisensi
 

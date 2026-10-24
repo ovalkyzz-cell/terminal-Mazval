@@ -43,6 +43,8 @@ MAX_SHELLS = 64
 STREAM_MAX_SECONDS = 290
 MAX_INPUT = 65536
 MAX_BUFFER = 4 * 1048576
+SSE_BATCH_BYTES = 65536
+SSE_BATCH_CHUNKS = 64
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 40
 
@@ -766,7 +768,7 @@ class ShellSession:
         received = 0
         stream = self.proc.stdout
         while True:
-            data = stream.read(4096)
+            data = stream.read(65536)
             if not data:
                 break
             if received < 4096:
@@ -1083,8 +1085,25 @@ def shell_stream(sid: str):
                 continue
             if item is None:
                 break
+            # Kumpulkan burst output dalam 1 pesan SSE, supaya output ratusan
+            # ribu baris tidak berubah jadi ribuan request kecil (lambat/lag).
+            buf = [item]
+            total = len(item)
+            got_end = False
+            while total < SSE_BATCH_BYTES and len(buf) < SSE_BATCH_CHUNKS:
+                try:
+                    nxt = s.chunks.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    got_end = True
+                    break
+                buf.append(nxt)
+                total += len(nxt)
             s.last_active = time.time()
-            yield f"data: {json.dumps({'o': item})}\n\n"
+            yield f"data: {json.dumps({'o': ''.join(buf)})}\n\n"
+            if got_end:
+                break
         if ended_reason:
             yield f"data: {json.dumps({'end': True, 'reason': ended_reason})}\n\n"
         else:
@@ -1124,7 +1143,9 @@ async def shell_input(sid: str, request: Request):
     if not s.alive:
         return JSONResponse({"error": "session_expired"}, status_code=404)
     try:
-        s.send(data)
+        # Offload: menulis ke PTY/pipe bisa memblokir saat buffer input penuh,
+        # jangan pernah memblokir event loop (semua request lain ikut nge-lag).
+        await run_in_threadpool(s.send, data)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
     return {"ok": True, "mode": s.mode}
@@ -1639,13 +1660,52 @@ HTML = f"""<!DOCTYPE html>
         const statusEl = document.getElementById('status');
         const term = new Terminal({{
             cursorBlink: true, theme: {{ background: '#121212', foreground: '#06D6A0', cursor: '#FF5964' }},
-            fontFamily: 'monospace', fontSize: 13, padding: 5
+            fontFamily: 'monospace', fontSize: 13, padding: 5, scrollback: 5000
         }});
         const fitAddon = new FitAddon.FitAddon();
         term.loadAddon(fitAddon);
-        term.open(document.getElementById('terminal-container'));
+        const termContainer = document.getElementById('terminal-container');
+        term.open(termContainer);
         fitAddon.fit();
-        window.addEventListener('resize', () => fitAddon.fit());
+
+        let fitRaf = 0;
+        function scheduleFit() {{
+            if (fitRaf) return;
+            fitRaf = requestAnimationFrame(() => {{ fitRaf = 0; try {{ fitAddon.fit(); }} catch (e) {{}} }});
+        }}
+        window.addEventListener('resize', scheduleFit);
+        if (window.visualViewport) {{
+            const vv = window.visualViewport;
+            const syncViewport = () => {{
+                const h = Math.round(vv.height);
+                // Keyboard HP terbuka: viewport mengecil -> kunci tinggi body
+                // ke viewport terlihat supaya terminal ikut rapi (bukan tertutup).
+                document.body.style.height = (h > 200 && Math.abs(h - window.innerHeight) > 80) ? (h + 'px') : '';
+                scheduleFit();
+            }};
+            vv.addEventListener('resize', syncViewport);
+            vv.addEventListener('scroll', syncViewport);
+        }}
+
+        // Render output lewat antrean requestAnimationFrame: burst output
+        // ratusan ribu baris ditelan per frame + ada batas, UI tidak macet.
+        let outBuf = '', outLen = 0, outRaf = 0;
+        const OUT_MAX = 2 * 1048576;
+        function writeOut(s) {{
+            if (!s) return;
+            outBuf += s; outLen += s.length;
+            if (outLen > OUT_MAX) {{
+                outBuf = '\\r\\n[OUTPUT DILEWAT - buffer penuh]\\r\\n';
+                outLen = outBuf.length;
+            }}
+            if (!outRaf) outRaf = requestAnimationFrame(flushOut);
+        }}
+        function flushOut() {{
+            outRaf = 0;
+            const chunk = outBuf;
+            outBuf = ''; outLen = 0;
+            if (chunk) term.write(chunk);
+        }}
 
         let shellId = null;
         let shellMode = 'pipe';
@@ -1700,6 +1760,7 @@ HTML = f"""<!DOCTYPE html>
                 setKernel(shellMode);
                 connectStream();
                 setStatus('ONLINE', true);
+                flushInput();
             }} catch (e) {{
                 setStatus('RETRY...', false);
                 setTimeout(openShell, 3000);
@@ -1714,13 +1775,13 @@ HTML = f"""<!DOCTYPE html>
             evSource.onmessage = (ev) => {{
                 try {{
                     const d = JSON.parse(ev.data);
-                    if (d.o) term.write(d.o);
+                    if (d.o) writeOut(d.o);
                     if (d.end) {{
                         evSource.close(); evSource = null;
                         const keepSid = shellId;
                         shellId = null;
                         const restart = () => {{
-                            term.write('\\r\\n[SESI TUTUP] membuka shell baru...\\r\\n');
+                            writeOut('\\r\\n[SESI TUTUP] membuka shell baru...\\r\\n');
                             setStatus('SYNC...', false);
                             setTimeout(openShell, 500);
                         }};
@@ -1732,7 +1793,7 @@ HTML = f"""<!DOCTYPE html>
                                     shellId = keepSid;
                                     shellMode = j.mode || shellMode;
                                     setKernel(shellMode);
-                                    term.write('\\r\\n[STREAM] menyambung ulang...\\r\\n');
+                                    writeOut('\\r\\n[STREAM] menyambung ulang...\\r\\n');
                                     connectStream();
                                     sendResize();
                                 }} else {{
@@ -1750,7 +1811,7 @@ HTML = f"""<!DOCTYPE html>
                     if (r.status === 404) {{
                         if (evSource) {{ evSource.close(); evSource = null; }}
                         shellId = null;
-                        term.write('\\r\\n[SESSION HILANG] instance berganti, membuka shell baru...\\r\\n');
+                        writeOut('\\r\\n[SESSION HILANG] instance berganti, membuka shell baru...\\r\\n');
                         setStatus('SYNC...', false);
                         openShell();
                     }}
@@ -1775,7 +1836,7 @@ HTML = f"""<!DOCTYPE html>
                     }}
                     if (evSource) {{ evSource.close(); evSource = null; }}
                     shellId = null;
-                    term.write('\\r\\n[SESSION HILANG] membuka shell baru...\\r\\n');
+                    writeOut('\\r\\n[SESSION HILANG] membuka shell baru...\\r\\n');
                     setStatus('SYNC...', false);
                     openShell();
                     return;
@@ -1786,57 +1847,67 @@ HTML = f"""<!DOCTYPE html>
             }}
         }}
 
-        async function flushInput() {{
-            flushTimer = null;
-            if (!shellId) return;
-            if (!inputBuf) return;
+        // Pengiriman input di-serial lewat rantai promise: urutan ketikan
+        // tidak pernah tertukar walau ada dua flush hampir bersamaan.
+        let sendChain = Promise.resolve();
+
+        function postAll(payload) {{
+            const SLICE = 4000;
+            return (async () => {{
+                for (let i = 0; i < payload.length; i += SLICE) {{
+                    await postInput(payload.slice(i, i + SLICE), 0);
+                    if (!shellId) break;
+                }}
+            }})();
+        }}
+
+        function flushInput() {{
+            if (flushTimer) {{ clearTimeout(flushTimer); flushTimer = null; }}
+            if (!shellId || !inputBuf) return;
             const payload = inputBuf;
             inputBuf = '';
-            const SLICE = 4000;
-            for (let i = 0; i < payload.length; i += SLICE) {{
-                await postInput(payload.slice(i, i + SLICE), 0);
-                if (!shellId) break;
-            }}
+            sendChain = sendChain.then(() => postAll(payload), () => postAll(payload));
         }}
 
         function queueInput(data) {{
             inputBuf += data;
-            if (!flushTimer) flushTimer = setTimeout(flushInput, 50);
+            if (inputBuf.length > 262144) inputBuf = inputBuf.slice(-262144);
+            // 0ms = kumpulkan event yang datang di frame yang sama saja,
+            // tanpa jeda 50ms yang membuat ketikan terasa lambat.
+            if (!flushTimer) flushTimer = setTimeout(flushInput, 0);
         }}
 
         function sendInterrupt() {{
-            if (!shellId) return;
+            if (!shellId) {{ openShell(); return; }}
             if (shellMode === 'pty') {{
                 queueInput('\\x03');
                 flushInput();
                 return;
             }}
-            term.write('^C\\r\\n');
+            writeOut('^C\\r\\n');
             fetch('/api/shell/' + shellId + '/interrupt', {{ method: 'POST' }}).catch(() => {{}});
         }}
 
         term.onData((data) => {{
-            if (!shellId) {{ openShell(); return; }}
-            if (data === '\\x03') {{
-                sendInterrupt();
-                return;
-            }}
-            if (data === '\\x0c' && shellMode !== 'pty') {{
-                term.clear();
+            if (data === '\\x03') {{ sendInterrupt(); return; }}
+            if (data === '\\x0c') {{
+                // Ctrl+L: diteruskan ke shell (seperti terminal asli) + bersihkan
+                // layar lokal supaya prompt ikut digambar ulang.
+                queueInput(data);
+                flushInput();
+                flushOut(); term.clear();
                 return;
             }}
             queueInput(data);
-            if (data.includes('\\r') || data.includes('\\n')) {{
-                if (flushTimer) {{ clearTimeout(flushTimer); flushTimer = null; }}
-                flushInput();
-            }}
+            if (data.includes('\\r') || data.includes('\\n')) flushInput();
+            if (!shellId) openShell();
         }});
 
-        function sendCommand(cmd) {{ if (shellId) {{ queueInput(cmd); flushInput(); }} term.focus(); }}
+        function sendCommand(cmd) {{ queueInput(cmd); flushInput(); if (!shellId) openShell(); term.focus(); }}
         function sendSpecial(key) {{
-            if (!shellId) {{ openShell(); return; }}
-            if (key === '\\x03') {{ sendInterrupt(); }}
-            else {{ queueInput(key); flushInput(); }}
+            if (key === '\\x03') {{ sendInterrupt(); term.focus(); return; }}
+            queueInput(key); flushInput();
+            if (!shellId) openShell();
             term.focus();
         }}
 

@@ -1,5 +1,5 @@
 import os, sys, subprocess, pty, gc, urllib.parse, shutil, mimetypes
-import codecs, errno, fcntl, json, select, signal, struct, termios, time
+import codecs, errno, fcntl, json, queue, select, signal, struct, termios, threading, time
 
 # ==========================================
 # 1. AUTO-INSTALLER TORNADO SERVER
@@ -373,18 +373,58 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
         const statusEl = document.getElementById('status');
         const term = new Terminal({{
             cursorBlink: true, theme: {{ background: '#121212', foreground: '#06D6A0', cursor: '#FF5964' }},
-            fontFamily: 'monospace', fontSize: 13, padding: 5
+            fontFamily: 'monospace', fontSize: 13, padding: 5, scrollback: 5000
         }});
         const fitAddon = new FitAddon.FitAddon();
         term.loadAddon(fitAddon);
-        term.open(document.getElementById('terminal-container'));
+        const termContainer = document.getElementById('terminal-container');
+        term.open(termContainer);
         fitAddon.fit();
-        window.addEventListener('resize', () => fitAddon.fit());
+
+        let fitRaf = 0;
+        function scheduleFit() {{
+            if (fitRaf) return;
+            fitRaf = requestAnimationFrame(() => {{ fitRaf = 0; try {{ fitAddon.fit(); }} catch (e) {{}} }});
+        }}
+        window.addEventListener('resize', scheduleFit);
+        if (window.visualViewport) {{
+            const vv = window.visualViewport;
+            const syncViewport = () => {{
+                const h = Math.round(vv.height);
+                // Keyboard HP terbuka -> kunci tinggi body ke viewport terlihat
+                // supaya terminal ikut mengecil dan tampil rapi, bukan tertutup.
+                document.body.style.height = (h > 200 && Math.abs(h - window.innerHeight) > 80) ? (h + 'px') : '';
+                scheduleFit();
+            }};
+            vv.addEventListener('resize', syncViewport);
+            vv.addEventListener('scroll', syncViewport);
+        }}
+
+        // Antrean render rAF: output raksasa (cat/seq/yes) ditelan per frame
+        // dengan batas buffer, tampilan tidak pernah lag/macet.
+        let outBuf = '', outLen = 0, outRaf = 0;
+        const OUT_MAX = 2 * 1048576;
+        function writeOut(s) {{
+            if (!s) return;
+            outBuf += s; outLen += s.length;
+            if (outLen > OUT_MAX) {{
+                outBuf = '\\r\\n[OUTPUT DILEWAT - buffer penuh]\\r\\n';
+                outLen = outBuf.length;
+            }}
+            if (!outRaf) outRaf = requestAnimationFrame(flushOut);
+        }}
+        function flushOut() {{
+            outRaf = 0;
+            const chunk = outBuf;
+            outBuf = ''; outLen = 0;
+            if (chunk) term.write(chunk);
+        }}
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         let ws = null;
         let resizeTimer = null;
         let retries = 0;
+        let pendingInput = '';
 
         function setStatus(txt, online) {{
             statusEl.innerText = txt;
@@ -393,7 +433,8 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
 
         function sendResize() {{
             if (ws && ws.readyState === WebSocket.OPEN) {{
-                ws.send(JSON.stringify({{ type: 'resize', cols: term.cols || 120, rows: term.rows || 40 }}));
+                // frame biner = kanal kontrol, tak pernah tabrakan dengan input teks
+                ws.send(new TextEncoder().encode(JSON.stringify({{ type: 'resize', cols: term.cols || 120, rows: term.rows || 40 }})));
             }}
         }}
 
@@ -413,28 +454,34 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
                 retries = 0;
                 setStatus('ONLINE', true);
                 sendResize();
+                if (pendingInput) {{
+                    const p = pendingInput;
+                    pendingInput = '';
+                    socket.send(p);
+                }}
                 term.focus();
             }};
             socket.onmessage = (e) => {{
                 if (socket !== ws) return;
                 const data = e.data;
-                if (typeof data === 'string' && data.startsWith('{{"type"')) {{
-                    try {{
-                        const msg = JSON.parse(data);
-                        if (msg.type === 'exit') {{
-                            term.write('\\r\\n[SESI TUTUP] membuka shell baru...\\r\\n');
-                            setStatus('SYNC...', false);
-                            setTimeout(connectWS, 700);
-                            return;
-                        }}
-                        if (msg.type === 'error') {{
-                            term.write('\\r\\n[ERROR] ' + (msg.message || 'gagal menjalankan shell') + '\\r\\n');
-                            setStatus('ERROR', false);
-                            return;
-                        }}
-                    }} catch (err) {{}}
+                if (typeof data === 'string') {{ writeOut(data); return; }}
+                // frame biner = pesan kontrol dari server: tak mungkin tertukar
+                // dengan output shell, sekalipun output diawali teks kontrol.
+                if (data instanceof Blob) {{
+                    data.text().then((t) => {{
+                        try {{
+                            const msg = JSON.parse(t);
+                            if (msg.type === 'exit') {{
+                                writeOut('\\r\\n[SESI TUTUP] membuka shell baru...\\r\\n');
+                                setStatus('SYNC...', false);
+                                setTimeout(connectWS, 700);
+                            }} else if (msg.type === 'error') {{
+                                writeOut('\\r\\n[ERROR] ' + (msg.message || 'gagal menjalankan shell') + '\\r\\n');
+                                setStatus('ERROR', false);
+                            }}
+                        }} catch (err) {{}}
+                    }});
                 }}
-                term.write(data);
             }};
             socket.onclose = () => {{
                 if (socket !== ws) return;
@@ -446,10 +493,16 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
 
         connectWS();
 
-        term.onData((data) => {{ if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); }});
+        function sendRaw(data) {{
+            if (ws && ws.readyState === WebSocket.OPEN) {{ ws.send(data); return; }}
+            // Sesi putus: ketikan ditahan (dibatasi) lalu dikirim saat tersambung.
+            pendingInput += (typeof data === 'string' ? data : '');
+            if (pendingInput.length > 65536) pendingInput = pendingInput.slice(-65536);
+        }}
+        term.onData((data) => sendRaw(data));
 
-        function sendCommand(cmd) {{ if (ws && ws.readyState === WebSocket.OPEN) {{ ws.send(cmd); term.focus(); }} }}
-        function sendSpecial(key) {{ if (ws && ws.readyState === WebSocket.OPEN) {{ ws.send(key); term.focus(); }} }}
+        function sendCommand(cmd) {{ sendRaw(cmd); term.focus(); }}
+        function sendSpecial(key) {{ sendRaw(key); term.focus(); }}
 
         function applyStorageUI(storage) {{
             const pct = storage.percent;
@@ -582,6 +635,9 @@ HTML_FRONTEND = f"""<!DOCTYPE html>
 # ==========================================
 DEFAULT_COLS = 120
 DEFAULT_ROWS = 40
+MAX_INPUT_Q = 512          # antrean input per koneksi (diblokir IOLoop utama)
+MAX_OUT_FRAMES = 400       # batas frame output tertunda ke klien (backpressure)
+MAX_BATCH_READ = 262144    # maksimal byte PTY dibaca per event loop
 
 
 def _pick_term():
@@ -671,6 +727,10 @@ class TerminalSocketHandler(tornado.websocket.WebSocketHandler):
         self.rows = DEFAULT_ROWS
         self._closing = False
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._in_q = queue.Queue(maxsize=MAX_INPUT_Q)
+        self._out_pending = 0
+        self._out_dropped = False
+        threading.Thread(target=self._writer_loop, daemon=True).start()
         self._spawn()
 
     # --- lifecycle -------------------------------------------------------
@@ -770,36 +830,73 @@ class TerminalSocketHandler(tornado.websocket.WebSocketHandler):
 
     # --- IO --------------------------------------------------------------
     def on_pty_read(self, fd, events):
-        try:
-            data = os.read(fd, 65536)
-        except (BlockingIOError, InterruptedError):
-            return
-        except OSError as exc:
-            if exc.errno == errno.EINTR:
-                return
+        # Sedot semua yang tersedia dalam satu event: burst output ratusan ribu
+        # baris jadi sedikit frame besar, bukan ribuan kebangkitan event loop.
+        parts = []
+        total = 0
+        eof = False
+        while total < MAX_BATCH_READ:
+            try:
+                data = os.read(fd, 65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    break
+                eof = True
+                break
+            if not data:
+                eof = True
+                break
+            parts.append(data)
+            total += len(data)
+        if parts:
+            try:
+                # Decode selalu jalan (state incremental harus maju),
+                # hanya pengiriman yang ditahan bila klien tertinggal.
+                self._send(self._decoder.decode(b"".join(parts)))
+            except Exception:
+                pass
+        if eof:
             self._shell_ended()
-            return
-        if not data:
-            self._shell_ended()
-            return
-        try:
-            self._send(self._decoder.decode(data))
-        except Exception:
-            pass
 
     def _send(self, text):
         if not text:
             return
+        if self._out_pending > MAX_OUT_FRAMES:
+            self._out_dropped = True
+            return
+        if self._out_dropped:
+            self._out_dropped = False
+            text = "\r\n[OUTPUT DILEWAT - klien tertinggal]\r\n" + text
         try:
-            if self.ws_connection is not None:
-                self.write_message(text)
+            if self.ws_connection is None:
+                return
+            fut = self.write_message(text)
         except Exception:
             self._shell_ended()
+            return
+        if fut is None:
+            return
+        self._out_pending += 1
+
+        def _done(f):
+            self._out_pending = max(0, self._out_pending - 1)
+            try:
+                f.exception()
+            except Exception:
+                pass
+
+        try:
+            fut.add_done_callback(_done)
+        except Exception:
+            self._out_pending = max(0, self._out_pending - 1)
 
     def _control(self, obj):
+        # Frame BINER: tak pernah bisa tertukar dengan output shell.
         try:
             if self.ws_connection is not None:
-                self.write_message(json.dumps(obj))
+                self.write_message(json.dumps(obj), binary=True)
         except Exception:
             pass
 
@@ -830,26 +927,43 @@ class TerminalSocketHandler(tornado.websocket.WebSocketHandler):
         if message is None:
             return
         if isinstance(message, bytes):
+            # Frame BINER = kontrol dari klien (resize). Input user selalu frame
+            # teks, sehingga ketikan user tak pernah bisa menyamar jadi kontrol.
             try:
-                message = message.decode("utf-8", "replace")
-            except Exception:
-                return
-        if message.startswith('{"type"'):
-            try:
-                msg = json.loads(message)
+                msg = json.loads(message.decode("utf-8", "replace"))
             except ValueError:
                 return
-            if not isinstance(msg, dict):
-                return
-            if msg.get("type") == "resize":
+            if isinstance(msg, dict) and msg.get("type") == "resize":
                 self.cols = _clamp(msg.get("cols"), 20, 500, self.cols)
                 self.rows = _clamp(msg.get("rows"), 5, 200, self.rows)
                 if self.fd is not None:
                     _set_winsize(self.fd, self.cols, self.rows)
             return
-        if self.fd is None:
+        if not isinstance(message, str) or not message:
             return
-        self._write_all(message.encode("utf-8", "replace"))
+        if self._closing or self.fd is None:
+            return
+        data = message.encode("utf-8", "replace")
+        try:
+            # Lewat antrean: IOLoop tak pernah memblokir walau buffer input PTY
+            # penuh (paste besar) - koneksi lain tetap responsif.
+            self._in_q.put_nowait(data)
+        except queue.Full:
+            pass
+
+    def _writer_loop(self):
+        while not self._closing:
+            try:
+                item = self._in_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if item is None:
+                return
+            try:
+                self._write_all(item, timeout=5.0)
+            except Exception:
+                if self.fd is None:
+                    return
 
     def on_close(self):
         self._closing = True

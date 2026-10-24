@@ -274,6 +274,51 @@ def test_shell(probe):
     else:
         check("skip uji proses CPU-bound (mode PIPE)", True)
 
+    # --- output besar, pesan kontrol palsu, urutan input, Ctrl+L ----------
+    mark = session.stream.offset()
+    out = session.cmd("seq 1 200000", wait=6.0)
+    norm = out.replace("\r\n", "\n")  # PTY memakai CRLF (ONLCR), pipe memakai LF
+    check(
+        "output besar terkirim utuh (batching SSE)",
+        "200000" in norm and "199999" in norm and "\n100\n" in norm,
+        out[-300:],
+    )
+
+    mark = session.stream.offset()
+    out = session.cmd("echo '{\"type\":\"exit\"}'", wait=1.5)
+    status, ping, _ = req("GET", f"/api/shell/{session.sid}")
+    check(
+        "teks mirip pesan kontrol tidak dianggap kontrol",
+        '{"type":"exit"}' in out and status == 200 and ping.get("alive") is True,
+        out[-300:],
+    )
+
+    mark = session.stream.offset()
+    session.send("echo URUT_PERTAMA\r")
+    session.send("echo URUT_KEDUA\r")
+    ok, tail = session.wait_text("URUT_KEDUA", 6.0, mark)
+    check(
+        "urutan input cepat tidak tertukar",
+        ok and 0 <= tail.find("URUT_PERTAMA") < tail.find("URUT_KEDUA"),
+        tail[-300:],
+    )
+
+    mark = session.stream.offset()
+    session.send("\x0c")  # Ctrl+L
+    time.sleep(1.0)
+    clear_tail = "".join(session.stream.chunks[mark:])
+    if mode == "pty":
+        check(
+            "Ctrl+L: layar bersih + prompt digambar ulang",
+            ("\x1b[2J" in clear_tail or "\x1b[H" in clear_tail)
+            and "mazval-term" in clear_tail,
+            repr(clear_tail[-200:]),
+        )
+    else:
+        check("Ctrl+L diteruskan ke shell tanpa merusak sesi", True)
+    out = session.cmd("echo CTRL_L_$((3*9))", wait=1.5)
+    check("shell tetap sehat setelah Ctrl+L", "CTRL_L_27" in out, out[-300:])
+
     mark = session.stream.offset()
     session.send("exit\r")
     ok, tail = session.wait_text("STORAGE_TERMINAL_SHELL_EXITED", 0.1, mark)

@@ -37,7 +37,17 @@ def http(method, path, data=None, headers=None, timeout=30):
 
 
 def is_control(msg):
-    return isinstance(msg, str) and msg.startswith('{"type"')
+    # Server mengirim pesan kontrol sebagai frame BINER (bytes),
+    # output shell selalu frame teks (str).
+    return isinstance(msg, (bytes, bytearray))
+
+
+def ctrl_get(msg, key):
+    try:
+        obj = json.loads(msg)
+    except (ValueError, TypeError):
+        return None
+    return obj.get(key) if isinstance(obj, dict) else None
 
 
 async def read_for(conn, seconds):
@@ -94,7 +104,9 @@ async def shell_tests(url):
     ok, text = await wait_text(conn, "/dev/pts", 6, buf)
     check("PTY: tty -> /dev/pts", ok, text[-300:])
 
-    conn.write_message(json.dumps({"type": "resize", "cols": 150, "rows": 50}))
+    conn.write_message(
+        json.dumps({"type": "resize", "cols": 150, "rows": 50}), binary=True
+    )
     await asyncio.sleep(0.4)
     conn.write_message("stty size\r")
     ok, text = await wait_text(conn, "50 150", 6, buf)
@@ -119,6 +131,50 @@ async def shell_tests(url):
     tail = "".join(m for m in buf if not is_control(m))
     check("tab-completion readline", "echo" in tail, tail[-300:])
 
+    # --- output besar, tabrakan pesan kontrol, urutan input ---------------
+    conn.write_message("seq 1 200000\r")
+    ok, text = await wait_text(conn, "200000", 20, buf)
+    check("output besar terkirim utuh (drain PTY)", ok, text[-300:])
+
+    mark = len(buf)
+    conn.write_message("echo '{\"type\":\"exit\"}'\r")
+    await asyncio.sleep(1.5)
+    fake = [m for m in buf[mark:] if is_control(m)]
+    check(
+        "teks mirip pesan kontrol tidak memutus sesi",
+        not any(ctrl_get(m, "type") == "exit" for m in fake),
+        str(fake),
+    )
+    conn.write_message("echo HIDUP_$((2*3))\r")
+    ok, text = await wait_text(conn, "HIDUP_6", 6, buf)
+    check("sesi tetap hidup setelah teks kontrol palsu", ok, text[-300:])
+
+    # input berbentuk JSON harus jadi ketikan user, bukan pesan kontrol
+    conn.write_message('{"type":"resize","cols":80,"rows":24}\r')
+    await asyncio.sleep(1.0)
+    conn.write_message("echo TERSALIN_$((5*8))\r")
+    ok, text = await wait_text(conn, "TERSALIN_40", 6, buf)
+    check("input mirip JSON tetap dieksekusi sebagai teks", ok, text[-300:])
+
+    conn.write_message(
+        json.dumps({"type": "resize", "cols": 90, "rows": 29}), binary=True
+    )
+    await asyncio.sleep(0.5)
+    conn.write_message("stty size\r")
+    ok, text = await wait_text(conn, "29 90", 6, buf)
+    check("resize biner tetap diterima shell setelah input JSON", ok, text[-300:])
+
+    mark = len(buf)
+    conn.write_message("echo URUT_PERTAMA\r")
+    conn.write_message("echo URUT_KEDUA\r")
+    ok, text = await wait_text(conn, "URUT_KEDUA", 6, buf)
+    joined = "".join(m for m in buf[mark:] if not is_control(m))
+    check(
+        "urutan input cepat tidak tertukar",
+        ok and 0 <= joined.find("URUT_PERTAMA") < joined.find("URUT_KEDUA"),
+        joined[-300:],
+    )
+
     conn.write_message("exit\r")
     controls = []
     deadline = time.time() + 8
@@ -133,16 +189,13 @@ async def shell_tests(url):
             break
         if is_control(msg):
             controls.append(msg)
-            try:
-                if json.loads(msg).get("type") == "exit":
-                    break
-            except ValueError:
-                pass
+            if ctrl_get(msg, "type") == "exit":
+                break
         else:
             buf.append(msg)
     check(
         "pesan exit terkirim saat shell berakhir",
-        any('"exit"' in c for c in controls),
+        any(ctrl_get(c, "type") == "exit" for c in controls),
         str(controls),
     )
     conn.close()
