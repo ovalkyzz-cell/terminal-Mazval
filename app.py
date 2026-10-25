@@ -152,9 +152,34 @@ else:
         if EPHEMERAL
         else "PIPE SHELL - echo/prompt dari readline"
     )
-BANNER_TITLE = "STORAGE TERMINAL KERNEL ACTIVE"
-BANNER_W = 50  # lebar kotak banner (judul diketengahkan presisi)
+
+# Deteksi info sistem untuk banner profesional
+try:
+    import platform
+    _UNAME_SYS = platform.system() or "Linux"
+    _UNAME_REL = platform.release() or "unknown"
+    _UNAME_ARCH = platform.machine() or os.uname().machine if hasattr(os, 'uname') else "unknown"
+except Exception:
+    _UNAME_SYS = "Linux"
+    _UNAME_REL = "unknown"
+    _UNAME_ARCH = "unknown"
+
+try:
+    _PYTHON_VER = platform.python_version() if 'platform' in dir() else ".".join(map(str, __import__('sys').version_info[:3]))
+except Exception:
+    _PYTHON_VER = "unknown"
+
+try:
+    _BASH_VER = subprocess.run([BASH_BIN, "--version"], capture_output=True, text=True, timeout=2).stdout.split('\n')[0].replace("GNU bash, version ", "").split("(")[0].strip() or "unknown"
+except Exception:
+    _BASH_VER = "unknown"
+
+BANNER_TITLE = "MAZVAL TERMINAL PRO"
+BANNER_W = 60  # lebar kotak banner (judul diketengahkan presisi)
 BANNER_STORE = "PERMANEN - TERSIMPAN DI CLOUD" if EPHEMERAL else "PERMANENT STORAGE"
+BANNER_KERNEL = f"{_UNAME_SYS} {_UNAME_ARCH} ({_UNAME_REL})"
+BANNER_PYTHON = _PYTHON_VER
+BANNER_BASH = _BASH_VER
 
 _RC_RUNFN = r'''
 command -v python >/dev/null 2>&1 || { command -v python3 >/dev/null 2>&1 && alias python=python3; }
@@ -229,8 +254,10 @@ printf '\\e[1;37m%s{BANNER_TITLE}%s\\e[0m\\n' "$__ls" "$__rs"
 printf '\\e[1;35m%s\\e[0m\\n' "$__sep"
 printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "env" "{BANNER_ENV}"
 printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "mode" "{BANNER_MODE}"
+printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "kernel" "{BANNER_KERNEL}"
+printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "bash" "{BANNER_BASH}"
+printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "python" "{BANNER_PYTHON}"
 printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "storage" "{BANNER_STORE}"
-printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "term" "{TERM_NAME}"
 printf '\\e[1;32m[OK] %-12s : %s\\e[0m\\n' "workdir" "$(pwd)"
 printf '\\n'
 """
@@ -1494,6 +1521,7 @@ HTML = f"""<!DOCTYPE html>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.8.0/lib/xterm-addon-web-links.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@700;800;900&display=swap');
 
@@ -1658,13 +1686,19 @@ HTML = f"""<!DOCTYPE html>
                 </div>
                 <div id="terminal-container"></div>
                 <div id="mobile-bar">
+                    <button class="brutal-btn" onclick="sendSpecial('\\x1b')">ESC</button>
                     <button class="brutal-btn" onclick="sendSpecial('\\x03')">^C</button>
                     <button class="brutal-btn" onclick="sendSpecial('\\t')">TAB</button>
-                    <button class="brutal-btn btn-primary-color" onclick="sendCommand('python3\\r')">PY</button>
-                    <button class="brutal-btn" onclick="sendCommand('ls -la\\r')">LS</button>
-                    <button class="brutal-btn" onclick="sendCommand('clear\\r')">CLR</button>
+                    <button class="brutal-btn" onclick="sendSpecial('\\x01')">^A</button>
+                    <button class="brutal-btn" onclick="sendSpecial('\\x05')">^E</button>
+                    <button class="brutal-btn" onclick="sendSpecial('|')">|</button>
                     <button class="brutal-btn" onclick="sendSpecial('\\x1b[A')">▲</button>
                     <button class="brutal-btn" onclick="sendSpecial('\\x1b[B')">▼</button>
+                    <button class="brutal-btn" onclick="sendSpecial('\\x1b[D')">◀</button>
+                    <button class="brutal-btn" onclick="sendSpecial('\\x1b[C')">▶</button>
+                    <button class="brutal-btn btn-primary-color" onclick="sendCommand('python3\\r')">PY</button>
+                    <button class="brutal-btn" onclick="sendCommand('ls -la\\r')">LS</button>
+                    <button class="brutal-btn btn-danger-color" onclick="sendCommand('clear\\r')">CLR</button>
                 </div>
             </div>
         </div>
@@ -1753,11 +1787,41 @@ HTML = f"""<!DOCTYPE html>
 
         const statusEl = document.getElementById('status');
         const term = new Terminal({{
-            cursorBlink: true, theme: {{ background: '#121212', foreground: '#06D6A0', cursor: '#FF5964' }},
-            fontFamily: 'Menlo, Monaco, "DejaVu Sans Mono", "Courier New", monospace', fontSize: 13, lineHeight: 1.15, scrollback: 5000
+            cursorBlink: true,
+            cursorStyle: 'block',
+            theme: {{
+                background: '#000000',
+                foreground: '#00ff66',
+                cursor: '#ff0055',
+                cursorAccent: '#000000',
+                selectionBackground: 'rgba(0, 255, 102, 0.3)',
+                black: '#000000',
+                red: '#ff5555',
+                green: '#55ff55',
+                yellow: '#ffff55',
+                blue: '#5555ff',
+                magenta: '#ff55ff',
+                cyan: '#55ffff',
+                white: '#bbbbbb',
+                brightBlack: '#555555',
+                brightRed: '#ff6b6b',
+                brightGreen: '#6bff6b',
+                brightYellow: '#ffff6b',
+                brightBlue: '#6b6bff',
+                brightMagenta: '#ff6bff',
+                brightCyan: '#6bffff',
+                brightWhite: '#ffffff'
+            }},
+            fontFamily: 'Menlo, Monaco, "DejaVu Sans Mono", "Courier New", monospace',
+            fontSize: 13,
+            lineHeight: 1.15,
+            scrollback: 10000
         }});
         const fitAddon = new FitAddon.FitAddon();
         term.loadAddon(fitAddon);
+        if (typeof WebLinksAddon !== 'undefined') {{
+            term.loadAddon(new WebLinksAddon.WebLinksAddon());
+        }}
         const termContainer = document.getElementById('terminal-container');
         term.open(termContainer);
         fitAddon.fit();
