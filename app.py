@@ -183,7 +183,16 @@ BANNER_BASH = _BASH_VER
 
 _RC_RUNFN = r'''
 command -v python >/dev/null 2>&1 || { command -v python3 >/dev/null 2>&1 && alias python=python3; }
-run() {
+
+# Peringatan friendly untuk editor di mode pipe (serverless)
+__mazval_shell_mode__="{SHELL_MODE}"
+if [ "$__mazval_shell_mode__" = "pipe" ]; then
+    nano() {{ echo "⚠️  Editor TUI membutuhkan mode PTY. Coba: sed, awk, atau gunakan copy file ke Termux lokal."; return 1; }}
+    vim() {{ echo "⚠️  Vim membutuhkan mode PTY. Jalankan di Termux lokal untuk akses penuh."; return 1; }}
+    vi() {{ echo "⚠️  Vi membutuhkan mode PTY. Jalankan di Termux lokal untuk akses penuh."; return 1; }}
+fi
+
+run() {{
     if [ -z "$1" ]; then
         echo "usage: run <file.py|file.sh|program> [arg...]"
         return 2
@@ -211,7 +220,7 @@ run() {
             return 126
             ;;
     esac
-}
+}}
 '''
 
 _RC_CONTENT = f"""set +H
@@ -748,11 +757,16 @@ class ShellSession:
 
     def _env(self):
         env = os.environ.copy()
+        # Utamakan xterm-256color untuk dukungan penuh TUI (nano/vim/htop)
+        term_val = "xterm-256color" if TERM_KNOWN else (TERM_NAME or "xterm-256color")
         env.update(
             {
-                "TERM": TERM_NAME,
+                "TERM": term_val,
+                "COLORTERM": "truecolor",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
                 "PYTHONUNBUFFERED": "1",
-                "HOME": "/tmp",
+                "HOME": STORAGE_DIR if os.access(STORAGE_DIR, os.W_OK) else "/tmp",
                 "HISTFILE": HIST_PATH,
                 "COLUMNS": str(self.cols),
                 "LINES": str(self.rows),
@@ -771,9 +785,15 @@ class ShellSession:
 
             def _child_setup():
                 os.setsid()
+                # Coba set controlling terminal, tapi jangan fatal jika gagal
+                # (misalnya di environment terbatasi seperti container)
                 try:
+                    os.dup2(slave, 0)  # stdin = slave
+                    os.dup2(slave, 1)  # stdout = slave
+                    os.dup2(slave, 2)  # stderr = slave
                     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-                except Exception:
+                except OSError:
+                    # Jika gagal, proses tetap jalan (readline masih handle echo/prompt)
                     pass
                 _reset_child_signals()
 
