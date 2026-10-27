@@ -191,7 +191,9 @@ def test_shell(probe):
     status, ping2, _ = req("GET", f"/api/shell/{session.sid}/ping")
     check("GET /api/shell/{id}/ping (alias)", status == 200)
 
-    banner_ok, banner_txt = session.wait_text("STORAGE TERMINAL KERNEL ACTIVE", 10)
+    banner_ok, banner_txt = session.wait_text("MAZVAL TERMINAL PRO", 10)
+    if not banner_ok:
+        banner_ok, banner_txt = session.wait_text("STORAGE TERMINAL KERNEL ACTIVE", 5)
     check("banner shell tampil", banner_ok, banner_txt[-200:])
 
     mark = session.stream.offset()

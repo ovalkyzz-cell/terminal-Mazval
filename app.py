@@ -185,14 +185,14 @@ _RC_RUNFN = r'''
 command -v python >/dev/null 2>&1 || { command -v python3 >/dev/null 2>&1 && alias python=python3; }
 
 # Peringatan friendly untuk editor di mode pipe (serverless)
-__mazval_shell_mode__="{SHELL_MODE}"
+__mazval_shell_mode__="''' + SHELL_MODE + r'''"
 if [ "$__mazval_shell_mode__" = "pipe" ]; then
-    nano() {{ echo "⚠️  Editor TUI membutuhkan mode PTY. Coba: sed, awk, atau gunakan copy file ke Termux lokal."; return 1; }}
-    vim() {{ echo "⚠️  Vim membutuhkan mode PTY. Jalankan di Termux lokal untuk akses penuh."; return 1; }}
-    vi() {{ echo "⚠️  Vi membutuhkan mode PTY. Jalankan di Termux lokal untuk akses penuh."; return 1; }}
+    nano() { echo "⚠️  Editor TUI membutuhkan mode PTY. Coba: sed, awk, atau gunakan copy file ke Termux lokal."; return 1; }
+    vim() { echo "⚠️  Vim membutuhkan mode PTY. Jalankan di Termux lokal untuk akses penuh."; return 1; }
+    vi() { echo "⚠️  Vi membutuhkan mode PTY. Jalankan di Termux lokal untuk akses penuh."; return 1; }
 fi
 
-run() {{
+run() {
     if [ -z "$1" ]; then
         echo "usage: run <file.py|file.sh|program> [arg...]"
         return 2
@@ -220,7 +220,7 @@ run() {{
             return 126
             ;;
     esac
-}}
+}
 '''
 
 _RC_CONTENT = f"""set +H
